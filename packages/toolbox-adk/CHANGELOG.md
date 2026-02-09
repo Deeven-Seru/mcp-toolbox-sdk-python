@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.9](https://github.com/googleapis/mcp-toolbox-sdk-python/compare/toolbox-adk-v0.5.8...toolbox-adk-v0.5.9) (2026-02-09)
+
+
+### Features
+
+* Enable package-specific client identification for MCP ([#525](https://github.com/googleapis/mcp-toolbox-sdk-python/issues/525)) ([7ac0d3f](https://github.com/googleapis/mcp-toolbox-sdk-python/commit/7ac0d3f167af1e47c26a3f43bdb48f3fc0a92109))
+
+
+### Bug Fixes
+
+* **adk:** implement `_get_declaration` to natively support ADK schema builder ([#534](https://github.com/googleapis/mcp-toolbox-sdk-python/issues/534)) ([4f11229](https://github.com/googleapis/mcp-toolbox-sdk-python/commit/4f112293becf3dc7c0e2f44cb7754a1eb8e45def))
+* **adk:** resolve OAuth persistence, ID token extraction, and auth flow crashes ([#535](https://github.com/googleapis/mcp-toolbox-sdk-python/issues/535)) ([663a4e1](https://github.com/googleapis/mcp-toolbox-sdk-python/commit/663a4e144b039207ef66b512d6287f9e520435de))
+
+
+### Documentation
+
+* Update README with simplified ADK import paths and modernized type hints in code examples ([#537](https://github.com/googleapis/mcp-toolbox-sdk-python/issues/537)) ([8e7ea07](https://github.com/googleapis/mcp-toolbox-sdk-python/commit/8e7ea0745de565729d6bfcb5708b7a8473a54f9e))
+
 ## [0.5.8](https://github.com/googleapis/mcp-toolbox-sdk-python/compare/toolbox-adk-v0.5.7...toolbox-adk-v0.5.8) (2026-01-29)
 
 ### Features

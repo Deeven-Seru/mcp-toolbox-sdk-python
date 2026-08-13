@@ -49,10 +49,10 @@ telemetry = [
     "opentelemetry-exporter-otlp>=1.20.0,<2.0.0"
 ]
 test = [
-    "black[jupyter]==26.1.0",
+    "black[jupyter]==26.3.1",
     "isort==8.0.0",
     "mypy==1.19.1",
-    "pytest==9.0.2",
+    "pytest==9.0.3",
     "pytest-aioresponses==0.3.0",
     "pytest-asyncio==1.3.0",
     "pytest-cov==7.0.0",

@@ -31,7 +31,10 @@ from google.genai import types
 from pydantic import ValidationError
 from toolbox_core.protocol import Protocol
 
+from tests.constants import TOOLBOX_SERVER_URL_STABLE
 from toolbox_adk import CredentialStrategy, ToolboxTool, ToolboxToolset
+
+pytestmark = pytest.mark.usefixtures("patch_toolbox_client_url")
 
 # Ensure TOOLBOX_VERSION is set for the fixture
 if "TOOLBOX_VERSION" not in os.environ:
@@ -49,8 +52,11 @@ class TestToolboxAdkIntegration:
     async def test_load_toolset_and_run(self):
         # Auth: TOOLBOX_IDENTITY for simplicity in this local test as we don't have ADK identity setup.
 
+        # Note: The STABLE URL passed here is automatically patched by the
+        # 'patch_toolbox_client_url' fixture to run against both
+        # the STABLE (5000) and DRAFT (5001) servers.
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -84,7 +90,7 @@ class TestToolboxAdkIntegration:
     async def test_load_toolset_with_default_protocol(self):
         """Test initializing toolset with default protocol (MCP)."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -108,7 +114,7 @@ class TestToolboxAdkIntegration:
     async def test_load_toolset_with_explicit_protocol(self):
         """Test initializing toolset with specific protocol (MCP_v20251125)."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.toolbox_identity(),
             protocol=Protocol.MCP_v20251125,
@@ -132,7 +138,7 @@ class TestToolboxAdkIntegration:
 
     async def test_partial_loading_by_names(self):
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -152,7 +158,7 @@ class TestToolboxAdkIntegration:
     async def test_bound_params_e2e(self):
         # Test binding param at toolset level
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             bound_params={"num_rows": "2"},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -168,7 +174,7 @@ class TestToolboxAdkIntegration:
 
     async def test_3lo_flow_simulation(self):
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             # Load a specific tool that we know the arguments for
             tool_names=["get-n-rows"],
             credentials=CredentialStrategy.user_identity(
@@ -265,7 +271,7 @@ class TestToolboxAdkIntegration:
     async def test_manual_token_integration(self):
         """Test the MANUAL_TOKEN strategy."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.manual_token(token="fake-manual-token"),
         )
@@ -284,7 +290,7 @@ class TestToolboxAdkIntegration:
         mock_creds.token = "fake-creds-token"
 
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.manual_credentials(credentials=mock_creds),
         )
@@ -297,7 +303,7 @@ class TestToolboxAdkIntegration:
     async def test_api_key_integration(self):
         """Test the API_KEY strategy."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=CredentialStrategy.api_key(key="my-key", header_name="x-foo"),
         )
@@ -333,7 +339,7 @@ class TestToolboxAdkIntegration:
 
         # 3. Use in Toolset
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             credentials=strategy,
         )
@@ -357,7 +363,7 @@ class TestToolboxAdkIntegration:
         creds_token = "Bearer strategy-token"
 
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name="my-toolset",
             additional_headers={"Authorization": manual_override},
             credentials=CredentialStrategy.manual_token(token="strategy-token"),
@@ -391,7 +397,7 @@ class TestBasicE2E:
     ):
         """Load a specific toolset"""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             toolset_name=toolset_name,
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -406,12 +412,11 @@ class TestBasicE2E:
     async def test_load_toolset_default(self):
         """Load the default toolset, i.e. all tools."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             credentials=CredentialStrategy.toolbox_identity(),
         )
         try:
             tools = await toolset.get_tools()
-            assert len(tools) == 7
             tool_names = {tool.name for tool in tools}
             expected_tools = [
                 "get-row-by-content-auth",
@@ -421,7 +426,9 @@ class TestBasicE2E:
                 "get-n-rows",
                 "search-rows",
                 "process-data",
+                "my-secure-tool",
             ]
+            assert len(tools) == len(expected_tools)
             assert tool_names == set(expected_tools)
         finally:
             await toolset.close()
@@ -429,7 +436,7 @@ class TestBasicE2E:
     async def test_run_tool(self):
         """Invoke a tool."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -448,10 +455,33 @@ class TestBasicE2E:
         finally:
             await toolset.close()
 
+    async def test_run_tool_url_binding(self):
+        """Tests URL Parameter Binding natively handled by the server."""
+        toolset = ToolboxToolset(
+            server_url=f"{TOOLBOX_SERVER_URL_STABLE}?num_rows=2",
+            tool_names=["get-n-rows"],
+            credentials=CredentialStrategy.toolbox_identity(),
+        )
+        try:
+            tools = await toolset.get_tools()
+            tool = tools[0]
+            assert isinstance(tool, ToolboxTool)
+
+            ctx = MagicMock()
+            # 'num_rows' is filtered from the schema and automatically injected by the server
+            response = await tool.run_async({}, ctx)
+
+            assert isinstance(response, str)
+            assert "row1" in response
+            assert "row2" in response
+            assert "row3" not in response
+        finally:
+            await toolset.close()
+
     async def test_run_tool_missing_params(self):
         """Invoke a tool with missing params."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -470,7 +500,7 @@ class TestBasicE2E:
     async def test_run_tool_wrong_param_type(self):
         """Invoke a tool with wrong param type."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -494,7 +524,7 @@ class TestBindParams:
     async def test_bind_params(self):
         """Bind a param to an existing tool."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             bound_params={"num_rows": "3"},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -516,7 +546,7 @@ class TestBindParams:
     async def test_bind_params_callable(self):
         """Bind a callable param to an existing tool."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-n-rows"],
             bound_params={"num_rows": lambda: "3"},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -542,7 +572,7 @@ class TestAuth:
     async def test_run_tool_unauth_with_auth(self, auth_token2: str):
         """Tests running a tool that doesn't require auth, with auth provided."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id"],
             auth_token_getters={"my-test-auth": lambda: auth_token2},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -559,7 +589,7 @@ class TestAuth:
     async def test_run_multiple_tools_unauth_with_auth(self, auth_token2: str):
         """Tests running multiple tools that don't require auth, verifying formatting of tool lists."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id", "search-rows"],
             auth_token_getters={"my-test-auth": lambda: auth_token2},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -576,7 +606,7 @@ class TestAuth:
     async def test_run_multiple_tools_partial_auth_usage(self, auth_token2: str):
         """Tests that when some tokens are used and some aren't across diverse tools, only the truly unused tokens appear in the error."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=[
                 "get-row-by-id-auth",
                 "search-rows",
@@ -601,7 +631,7 @@ class TestAuth:
         """Tests running a tool requiring auth without providing auth."""
         # Note: We load it without auth getters. Invocation should fail.
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id-auth"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -621,7 +651,7 @@ class TestAuth:
     async def test_run_tool_wrong_auth(self, auth_token2: str):
         """Tests running a tool with incorrect auth."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id-auth"],
             auth_token_getters={"my-test-auth": lambda: auth_token2},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -631,18 +661,21 @@ class TestAuth:
             tool = tools[0]
             ctx = MagicMock()
 
-            with pytest.raises(
-                Exception,
-                match=r"401 \(Unauthorized\)",
-            ):
+            try:
                 await tool.run_async({"id": "2"}, ctx)
+                pytest.fail("Expected tool to fail with auth error")
+            except Exception as e:
+                err_str = str(e)
+                assert (
+                    "401" in err_str or "-32600" in err_str
+                ), f"Unexpected error message: {err_str}"
         finally:
             await toolset.close()
 
     async def test_run_tool_auth(self, auth_token1: str):
         """Tests running a tool with correct auth."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id-auth"],
             auth_token_getters={"my-test-auth": lambda: auth_token1},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -664,7 +697,7 @@ class TestAuth:
             return auth_token1
 
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["get-row-by-id-auth"],
             auth_token_getters={"my-test-auth": get_token_asynchronously},
             credentials=CredentialStrategy.toolbox_identity(),
@@ -690,7 +723,7 @@ class TestOptionalParams:
     async def test_run_tool_with_optional_params_omitted(self):
         """Invoke a tool providing only the required parameter."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["search-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -709,7 +742,7 @@ class TestOptionalParams:
     async def test_run_tool_with_all_valid_params(self):
         """Invoke a tool providing all parameters."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["search-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -729,7 +762,7 @@ class TestOptionalParams:
     async def test_run_tool_with_missing_required_param(self):
         """Invoke a tool without its required parameter."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["search-rows"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -754,7 +787,7 @@ class TestMapParams:
     async def test_run_tool_with_map_params(self):
         """Invoke a tool with valid map parameters."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["process-data"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -785,7 +818,7 @@ class TestMapParams:
     async def test_run_tool_with_wrong_map_value_type(self):
         """Invoke a tool with a map parameter having the wrong value type."""
         toolset = ToolboxToolset(
-            server_url="http://localhost:5000",
+            server_url=TOOLBOX_SERVER_URL_STABLE,
             tool_names=["process-data"],
             credentials=CredentialStrategy.toolbox_identity(),
         )
@@ -888,3 +921,146 @@ class TestAgentIntegration:
 
         assert event_count > 0
         assert success, "Agent failed to use the tool successfully"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+class TestSecureParamsE2E:
+    """End-to-end integration tests for ADK with secure parameters."""
+
+    async def test_adk_toolset_with_secure_params(self):
+        """Tests ToolboxToolset loading by toolset_name and running tools with secure parameters."""
+        toolset = ToolboxToolset(
+            server_url=TOOLBOX_SERVER_URL_STABLE,
+            toolset_name="my-secure-toolset",
+            credentials=CredentialStrategy.toolbox_identity(),
+            secure_params={"name": "Alice"},
+        )
+        try:
+            tools = await toolset.get_tools()
+            by_name = {t.name: t for t in tools}
+            assert "my-secure-tool" in by_name
+            tool = by_name["my-secure-tool"]
+            ctx = MagicMock()
+            result = await tool.run_async({"id": 1}, ctx)
+            assert isinstance(result, str)
+            assert "Alice" in result
+        finally:
+            await toolset.close()
+
+    async def test_adk_tool_bind_secure_param(self):
+        """Tests binding a secure parameter on an individual ADK ToolboxTool."""
+        toolset = ToolboxToolset(
+            server_url=TOOLBOX_SERVER_URL_STABLE,
+            toolset_name="my-secure-toolset",
+            credentials=CredentialStrategy.toolbox_identity(),
+        )
+        try:
+            tools = await toolset.get_tools()
+            by_name = {t.name: t for t in tools}
+            assert "my-secure-tool" in by_name
+            tool = by_name["my-secure-tool"]
+            bound_tool = tool.bind_secure_param("name", "Alice")
+            ctx = MagicMock()
+            result = await bound_tool.run_async({"id": 1}, ctx)
+            assert isinstance(result, str)
+            assert "Alice" in result
+        finally:
+            await toolset.close()
+
+    async def test_adk_dynamic_callable_re_evaluation_per_invocation(self):
+        """Tests that dynamic callables are re-evaluated per invocation in ADK."""
+        counter = 0
+
+        def dynamic_name():
+            nonlocal counter
+            counter += 1
+            return f"User{counter}"
+
+        toolset = ToolboxToolset(
+            server_url=TOOLBOX_SERVER_URL_STABLE,
+            toolset_name="my-secure-toolset",
+            credentials=CredentialStrategy.toolbox_identity(),
+            secure_params={"name": dynamic_name},
+        )
+        try:
+            tools = await toolset.get_tools()
+            by_name = {t.name: t for t in tools}
+            assert "my-secure-tool" in by_name
+            tool = by_name["my-secure-tool"]
+            ctx = MagicMock()
+
+            # First invocation -> counter = 1 -> "User1"
+            res1 = await tool.run_async({"id": 1}, ctx)
+            assert isinstance(res1, str)
+            assert "User1" in res1
+
+            # Second invocation -> counter = 2 -> "User2"
+            res2 = await tool.run_async({"id": 1}, ctx)
+            assert isinstance(res2, str)
+            assert "User2" in res2
+        finally:
+            await toolset.close()
+
+    async def test_adk_secure_param_declaration_isolation(self):
+        """Tests that secure parameters are excluded from ADK Gemini function declaration."""
+        toolset = ToolboxToolset(
+            server_url=TOOLBOX_SERVER_URL_STABLE,
+            toolset_name="my-secure-toolset",
+            credentials=CredentialStrategy.toolbox_identity(),
+        )
+        try:
+            tools = await toolset.get_tools()
+            by_name = {t.name: t for t in tools}
+            assert "my-secure-tool" in by_name
+            tool = by_name["my-secure-tool"]
+            declaration = tool._get_declaration()
+            assert declaration is not None
+            assert declaration.parameters is not None
+            assert hasattr(declaration.parameters, "properties")
+            assert "id" in declaration.parameters.properties
+            assert "name" not in declaration.parameters.properties
+        finally:
+            await toolset.close()
+
+    @pytest.mark.parametrize(
+        ("method_name", "param_name", "param_val", "expected_match"),
+        [
+            (
+                "bind_param",
+                "name",
+                "Alice",
+                "parameter 'name' is a secure parameter; use bind_secure_param/bind_secure_params instead",
+            ),
+            (
+                "bind_secure_param",
+                "id",
+                1,
+                "parameter 'id' is a regular parameter; use bind_param/bind_params instead",
+            ),
+        ],
+    )
+    async def test_adk_cross_binding_guidance_error(
+        self,
+        method_name,
+        param_name,
+        param_val,
+        expected_match,
+    ):
+        """Tests that cross-binding on ADK tool raises guidance error."""
+        toolset = ToolboxToolset(
+            server_url=TOOLBOX_SERVER_URL_STABLE,
+            toolset_name="my-secure-toolset",
+            credentials=CredentialStrategy.toolbox_identity(),
+        )
+        try:
+            tools = await toolset.get_tools()
+            by_name = {t.name: t for t in tools}
+            if "my-secure-tool" not in by_name:
+                pytest.skip("my-secure-tool not found in my-secure-toolset")
+            tool = by_name["my-secure-tool"]
+            method = getattr(tool, method_name)
+            with pytest.raises(ValueError, match=expected_match):
+                method(param_name, param_val)
+        finally:
+            await toolset.close()

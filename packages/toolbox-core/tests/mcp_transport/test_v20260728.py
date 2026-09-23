@@ -1,0 +1,665 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+import pytest_asyncio
+from aiohttp import ClientSession
+from aioresponses import aioresponses
+
+from toolbox_core.mcp_transport.v20260728 import types
+from toolbox_core.mcp_transport.v20260728.mcp import McpHttpTransportV20260728
+from toolbox_core.protocol import ManifestSchema, Protocol
+
+
+def create_fake_tools_list_result():
+    return types.ListToolsResult(
+        tools=[
+            {
+                "name": "get_weather",
+                "description": "Gets the weather.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            }
+        ]
+    )
+
+
+@pytest_asyncio.fixture(
+    params=[False, True], ids=["telemetry_disabled", "telemetry_enabled"]
+)
+async def transport(request, mocker):
+    if request.param:
+        mocker.patch("toolbox_core.mcp_transport.telemetry.TELEMETRY_AVAILABLE", True)
+        mocker.patch(
+            "toolbox_core.mcp_transport.telemetry.get_tracer", return_value=MagicMock()
+        )
+        mocker.patch(
+            "toolbox_core.mcp_transport.telemetry.get_meter", return_value=MagicMock()
+        )
+        mocker.patch(
+            "toolbox_core.mcp_transport.telemetry.create_operation_duration_histogram",
+            return_value=MagicMock(),
+        )
+        mocker.patch(
+            "toolbox_core.mcp_transport.telemetry.create_session_duration_histogram",
+            return_value=MagicMock(),
+        )
+        mocker.patch(
+            "toolbox_core.mcp_transport.telemetry.start_span",
+            return_value=(MagicMock(), "00-traceparent", ""),
+        )
+        mocker.patch("toolbox_core.mcp_transport.telemetry.end_span")
+        mocker.patch("toolbox_core.mcp_transport.telemetry.record_operation_duration")
+        mocker.patch("toolbox_core.mcp_transport.telemetry.record_session_duration")
+    mock_session = AsyncMock(spec=ClientSession)
+    transport = McpHttpTransportV20260728(
+        "http://fake-server.com",
+        session=mock_session,
+        protocol=Protocol.MCP_DRAFT,
+        telemetry_enabled=request.param,
+    )
+    yield transport
+    await transport.close()
+
+
+@pytest.mark.asyncio
+class TestMcpHttpTransportV20260728:
+
+    # --- Request Sending Tests (Standard + Header) ---
+
+    async def test_send_request_success(self, transport):
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {"jsonrpc": "2.0", "id": "1", "result": {}}
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        result = await transport._send_request("url", TestRequest())
+        assert result == TestResult()
+
+    async def test_send_request_adds_protocol_header(self, transport):
+        """Test that the MCP-Protocol-Version header is added."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {"jsonrpc": "2.0", "id": "1", "result": {}}
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        await transport._send_request("url", TestRequest())
+
+        call_args = transport._session.post.call_args
+        headers = call_args.kwargs["headers"]
+        assert headers["MCP-Protocol-Version"] == "2026-07-28"
+        assert headers["Mcp-Method"] == "method"
+        assert "Mcp-Name" not in headers
+
+    async def test_send_request_adds_mcp_name_header_for_tools_call(self, transport):
+        """Test that the Mcp-Name header is added for tools/call."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {"jsonrpc": "2.0", "id": "1", "result": {}}
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestParams(types.BaseModel):
+            name: str
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "tools/call"
+            params: TestParams
+
+            def get_result_model(self):
+                return TestResult
+
+        await transport._send_request(
+            "url", TestRequest(params=TestParams(name="test_tool"))
+        )
+
+        call_args = transport._session.post.call_args
+        headers = call_args.kwargs["headers"]
+        assert headers["Mcp-Method"] == "tools/call"
+        assert headers["Mcp-Name"] == "test_tool"
+
+    async def test_send_request_adds_mcp_name_header_for_prompts_get(self, transport):
+        """Test that the Mcp-Name header is added for prompts/get."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {"jsonrpc": "2.0", "id": "1", "result": {}}
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestParams(types.BaseModel):
+            name: str
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "prompts/get"
+            params: TestParams
+
+            def get_result_model(self):
+                return TestResult
+
+        await transport._send_request(
+            "url", TestRequest(params=TestParams(name="test_prompt"))
+        )
+
+        call_args = transport._session.post.call_args
+        headers = call_args.kwargs["headers"]
+        assert headers["Mcp-Method"] == "prompts/get"
+        assert headers["Mcp-Name"] == "test_prompt"
+
+    async def test_send_request_adds_mcp_name_header_for_resources_read(
+        self, transport
+    ):
+        """Test that the Mcp-Name header is added for resources/read."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {"jsonrpc": "2.0", "id": "1", "result": {}}
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestParams(types.BaseModel):
+            uri: str
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "resources/read"
+            params: TestParams
+
+            def get_result_model(self):
+                return TestResult
+
+        await transport._send_request(
+            "url", TestRequest(params=TestParams(uri="file:///test.txt"))
+        )
+
+        call_args = transport._session.post.call_args
+        headers = call_args.kwargs["headers"]
+        assert headers["Mcp-Method"] == "resources/read"
+        assert headers["Mcp-Name"] == "file:///test.txt"
+
+    # --- Version Negotiation Tests ---
+
+    async def test_version_negotiation_raises_fallback(self, transport):
+        """Tests that the client raises ProtocolNegotiationError when the server requests a fallback."""
+        from toolbox_core.exceptions import ProtocolNegotiationError
+
+        mock_response_reject = AsyncMock()
+        mock_response_reject.ok = False
+        mock_response_reject.status = 400
+        mock_response_reject.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32022,
+                "message": "Unsupported protocol version",
+                "data": {"supported": ["2026-07-28"]},
+            },
+        }
+
+        transport._session.post.return_value.__aenter__.return_value = (
+            mock_response_reject
+        )
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        with pytest.raises(ProtocolNegotiationError) as exc_info:
+            await transport._send_request("url", TestRequest())
+
+        assert exc_info.value.negotiated_version == "2026-07-28"
+        assert transport._session.post.call_count == 1
+
+    async def test_version_negotiation_raises_fallback_200_ok(self, transport):
+        """Tests that the client raises ProtocolNegotiationError when the server returns 200 OK with -32022."""
+        from toolbox_core.exceptions import ProtocolNegotiationError
+
+        mock_response_reject = AsyncMock()
+        mock_response_reject.ok = True
+        mock_response_reject.status = 200
+        mock_response_reject.content.at_eof = MagicMock(return_value=False)
+        mock_response_reject.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32022,
+                "message": "Unsupported protocol version",
+                "data": {"supported": ["2026-07-28"]},
+            },
+        }
+
+        transport._session.post.return_value.__aenter__.return_value = (
+            mock_response_reject
+        )
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        with pytest.raises(ProtocolNegotiationError) as exc_info:
+            await transport._send_request("url", TestRequest())
+
+        assert exc_info.value.negotiated_version == "2026-07-28"
+        assert transport._session.post.call_count == 1
+
+    async def test_version_negotiation_empty_intersection(self, transport):
+        """Tests that the client errors immediately without retrying when there is no mutual version."""
+        mock_response_reject = AsyncMock()
+        mock_response_reject.ok = False
+        mock_response_reject.status = 400
+        mock_response_reject.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32022,
+                "message": "Unsupported protocol version",
+                "data": {"supported": ["UNSUPPORTED-VERSION"]},
+            },
+        }
+
+        transport._session.post.return_value.__aenter__.return_value = (
+            mock_response_reject
+        )
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        with pytest.raises(
+            RuntimeError, match="No mutually supported protocol version"
+        ):
+            await transport._send_request("url", TestRequest())
+
+        assert transport._session.post.call_count == 1
+
+    # --- Tool Management Tests ---
+
+    async def test_tools_list_success(self, transport, mocker):
+        mocker.patch.object(transport, "_ensure_initialized", new_callable=AsyncMock)
+        mocker.patch.object(
+            transport,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=create_fake_tools_list_result(),
+        )
+        manifest = await transport.tools_list()
+        assert isinstance(manifest, ManifestSchema)
+        assert "get_weather" in manifest.tools
+
+    async def test_tools_list_with_toolset_name_and_query_params(self, mocker):
+        """Test listing tools with a toolset name when base_url contains query parameters."""
+        mock_session = AsyncMock(spec=ClientSession)
+        transport = McpHttpTransportV20260728(
+            "http://fake-server.com?proj=xyz&env=prod",
+            session=mock_session,
+            protocol=Protocol.MCP_DRAFT,
+        )
+        try:
+            mocker.patch.object(
+                transport, "_ensure_initialized", new_callable=AsyncMock
+            )
+            mocker.patch.object(
+                transport,
+                "_send_request",
+                new_callable=AsyncMock,
+                return_value=create_fake_tools_list_result(),
+            )
+            manifest = await transport.tools_list(toolset_name="custom_toolset")
+            assert isinstance(manifest, ManifestSchema)
+            expected_url = "http://fake-server.com/mcp/custom_toolset?proj=xyz&env=prod"
+            call_args = transport._send_request.call_args
+            assert call_args.kwargs["url"] == expected_url
+        finally:
+            await transport.close()
+
+    async def test_tool_invoke_success(self, transport, mocker):
+        mocker.patch.object(transport, "_ensure_initialized", new_callable=AsyncMock)
+        mocker.patch.object(
+            transport,
+            "_send_request",
+            new_callable=AsyncMock,
+            return_value=types.CallToolResult(
+                content=[types.TextContent(type="text", text="Result")]
+            ),
+        )
+        result = await transport.tool_invoke("tool", {}, {})
+        assert result == "Result"
+
+    async def test_send_request_400_with_json_rpc_error(self, transport):
+        # Test that an HTTP 400 with a non-negotiation JSON-RPC error is parsed properly.
+        mock_response = AsyncMock()
+        mock_response.ok = False
+        mock_response.status = 400
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32602, "message": "missing _meta"},
+        }
+
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await transport._send_request(
+                "http://test.com/mcp",
+                types.JSONRPCRequest(method="test", params={}),
+            )
+
+        assert "MCP request failed with code -32602" in str(exc_info.value)
+        assert "missing _meta" in str(exc_info.value)
+
+    async def test_send_request_400_with_raw_text(self, transport):
+        # Test that an HTTP 400 with non-JSON text is raised with the raw string payload.
+        mock_response = AsyncMock()
+        mock_response.ok = False
+        mock_response.status = 400
+        mock_response.reason = "Bad Request"
+        mock_response.json.side_effect = Exception("Not JSON")
+        mock_response.text.return_value = "<html/>"
+
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await transport._send_request(
+                "http://test.com/mcp",
+                types.JSONRPCRequest(method="test", params={}),
+            )
+
+        assert "API request failed with status 400" in str(exc_info.value)
+        assert "<html/>" in str(exc_info.value)
+
+    async def test_version_negotiation_legacy_string_fallback(self, transport):
+        """Tests that the client raises ProtocolNegotiationError when the server returns a string 'invalid protocol version' error."""
+        from toolbox_core.exceptions import ProtocolNegotiationError
+
+        mock_response_reject = AsyncMock()
+        mock_response_reject.ok = False
+        mock_response_reject.status = 400
+        mock_response_reject.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": "invalid protocol version",
+        }
+
+        transport._session.post.return_value.__aenter__.return_value = (
+            mock_response_reject
+        )
+
+        class TestResult(types.BaseModel):
+            pass
+
+        class TestRequest(types.MCPRequest[TestResult]):
+            method: str = "method"
+            params: dict = {}
+
+            def get_result_model(self):
+                return TestResult
+
+        # The fallback defaults to picking the next version in the supported list, or 2025-11-25.
+        with pytest.raises(ProtocolNegotiationError) as exc_info:
+            await transport._send_request("url", TestRequest())
+
+        assert exc_info.value.negotiated_version == Protocol.MCP_v20251125
+        assert transport._session.post.call_count == 1
+
+    # --- Spec Compliance & Metadata Tests (SEP-2575) ---
+
+    async def test_result_meta_parsing_server_info(self, transport):
+        """Test parsing of _meta with io.modelcontextprotocol/serverInfo in result."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "resultType": "complete",
+                "tools": [],
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "ToolboxServer",
+                        "version": "1.8.0",
+                    }
+                },
+            },
+        }
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        res = await transport._send_request(
+            "http://test.com/mcp",
+            types.ListToolsRequest(
+                params=types.ListToolsRequestParams(
+                    field_meta=types.MCPMeta(
+                        protocol_version="2026-07-28",
+                        client_info=types.Implementation(name="test", version="1.0"),
+                        client_capabilities=types.ClientCapabilities(),
+                    )
+                )
+            ),
+        )
+        assert res is not None
+        assert res.result_type == "complete"
+        assert res.field_meta is not None
+        assert res.field_meta.server_info is not None
+        assert res.field_meta.server_info.name == "ToolboxServer"
+        assert res.field_meta.server_info.version == "1.8.0"
+
+    async def test_tools_list_uses_server_info_from_meta(self, transport):
+        """Test that tools_list extracts serverVersion dynamically from _meta."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "resultType": "complete",
+                "tools": [
+                    {
+                        "name": "sample_tool",
+                        "description": "Sample",
+                        "inputSchema": {"type": "object"},
+                    }
+                ],
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "ToolboxServer",
+                        "version": "2.5.0",
+                    }
+                },
+            },
+        }
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        manifest = await transport.tools_list()
+        assert manifest.serverVersion == "2.5.0"
+        assert "sample_tool" in manifest.tools
+
+    async def test_result_meta_optional_server_info(self, transport):
+        """Test that missing _meta or missing serverInfo falls back to empty version."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "resultType": "complete",
+                "tools": [],
+            },
+        }
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        manifest = await transport.tools_list()
+        assert manifest.serverVersion == ""
+
+    async def test_result_type_parsing_and_fallback(self, transport):
+        """Test that resultType defaults to 'complete' if missing in response result."""
+        res = types.ListToolsResult.model_validate({"tools": []})
+        assert res.result_type == "complete"
+
+        res_custom = types.ListToolsResult.model_validate(
+            {"tools": [], "resultType": "input_required"}
+        )
+        assert res_custom.result_type == "input_required"
+
+    async def test_client_capabilities_secure_parameters(self):
+        """Test that ClientCapabilities advertises toolbox.v1 secure_parameters support."""
+        caps = types.ClientCapabilities()
+        assert caps.extensions is not None
+        assert "com.google.cloud/toolbox.v1" in caps.extensions
+        assert caps.extensions["com.google.cloud/toolbox.v1"] == {}
+
+    async def test_tools_list_parses_secure_input_schema(self, transport):
+        """Test that secureInputSchema is parsed into ToolSchema.secure_parameters."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {
+                "tools": [
+                    {
+                        "name": "secure_tool",
+                        "description": "Tool with secure input schema",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "search query",
+                                }
+                            },
+                            "required": ["query"],
+                        },
+                        "secureInputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "api_key": {
+                                    "type": "string",
+                                    "description": "Secret API Key",
+                                }
+                            },
+                            "required": ["api_key"],
+                        },
+                    }
+                ]
+            },
+        }
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        manifest = await transport.tools_list()
+        assert "secure_tool" in manifest.tools
+        tool = manifest.tools["secure_tool"]
+        assert len(tool.parameters) == 1
+        assert tool.parameters[0].name == "query"
+        assert len(tool.secure_parameters) == 1
+        assert tool.secure_parameters[0].name == "api_key"
+        assert tool.secure_parameters[0].required is True
+        assert tool.secure_parameters[0].description == "Secret API Key"
+
+    async def test_tool_invoke_with_secure_arguments(self, transport):
+        """Test that tool_invoke sends secure_arguments in CallToolRequestParams."""
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.status = 200
+        mock_response.content = Mock()
+        mock_response.content.at_eof.return_value = False
+        mock_response.json.return_value = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {"content": [{"type": "text", "text": "invocation success"}]},
+        }
+        transport._session.post.return_value.__aenter__.return_value = mock_response
+
+        result = await transport.tool_invoke(
+            "secure_tool",
+            {"query": "search term"},
+            {"custom-header": "value"},
+            secure_arguments={"api_key": "sec-val-999"},
+        )
+        assert result == "invocation success"
+
+        call_args = transport._session.post.call_args
+        sent_json = call_args.kwargs["json"]
+        assert sent_json["method"] == "tools/call"
+        params = sent_json["params"]
+        assert params["name"] == "secure_tool"
+        assert params["arguments"] == {"query": "search term"}
+        assert params["secureArguments"] == {"api_key": "sec-val-999"}

@@ -19,16 +19,22 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
+from tests.constants import TOOLBOX_SERVER_URL_STABLE
 from toolbox_core.client import ToolboxClient
 from toolbox_core.protocol import Protocol
 from toolbox_core.tool import ToolboxTool
+
+pytestmark = pytest.mark.usefixtures("patch_toolbox_client_url")
 
 
 # --- Shared Fixtures Defined at Module Level ---
 @pytest_asyncio.fixture(scope="function")
 async def toolbox():
     """Creates a ToolboxClient instance shared by all tests in this module."""
-    toolbox = ToolboxClient("http://localhost:5000", protocol=Protocol.MCP)
+    # Note: The STABLE URL passed here is automatically patched by the
+    # 'patch_toolbox_client_url' fixture to run against both
+    # the STABLE (5000) and DRAFT (5001) servers.
+    toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE, protocol=Protocol.MCP)
     try:
         yield toolbox
     finally:
@@ -69,7 +75,6 @@ class TestBasicE2E:
     async def test_load_toolset_default(self, toolbox: ToolboxClient):
         """Load the default toolset, i.e. all tools."""
         toolset = await toolbox.load_toolset()
-        assert len(toolset) == 7
         tool_names = {tool.__name__ for tool in toolset}
         expected_tools = [
             "get-row-by-content-auth",
@@ -80,6 +85,14 @@ class TestBasicE2E:
             "search-rows",
             "process-data",
         ]
+
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            expected_tools.append("my-secure-tool")
+
+        assert len(toolset) == len(expected_tools)
         assert tool_names == set(expected_tools)
 
     async def test_run_tool(self, get_n_rows_tool: ToolboxTool):
@@ -112,7 +125,7 @@ class TestBasicE2E:
     async def test_load_and_run_tool_with_telemetry(self, telemetry_enabled: bool):
         """Load and invoke a tool with telemetry_enabled=True/False."""
         async with ToolboxClient(
-            "http://localhost:5000",
+            TOOLBOX_SERVER_URL_STABLE,
             protocol=Protocol.MCP,
             telemetry_enabled=telemetry_enabled,
         ) as toolbox:
@@ -237,11 +250,8 @@ class TestAuth:
             "get-row-by-content-auth",
             auth_token_getters={"my-test-auth": lambda: auth_token1},
         )
-        with pytest.raises(
-            Exception,
-            match="no field named row_data in claims",
-        ):
-            await tool()
+        response = await tool()
+        assert "no field named row_data in claims" in response
 
 
 @pytest.mark.asyncio

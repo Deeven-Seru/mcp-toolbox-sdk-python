@@ -21,7 +21,9 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from aiohttp import web
 
-from toolbox_core.client import ToolboxClient
+from tests.constants import TOOLBOX_SERVER_URL_STABLE
+from toolbox_core.client import ToolboxClient, _McpTransportProxy
+from toolbox_core.exceptions import ProtocolNegotiationError
 from toolbox_core.itransport import ITransport
 from toolbox_core.protocol import (
     ManifestSchema,
@@ -66,6 +68,7 @@ class MockTransport(ITransport):
         arguments: dict,
         headers: Mapping[str, str],
         telemetry_attributes: Optional[TelemetryAttributes] = None,
+        secure_arguments: Optional[dict] = None,
     ) -> str:
         return await self.tool_invoke_mock(tool_name, arguments, headers)
 
@@ -246,6 +249,98 @@ async def test_load_tool_not_found_in_manifest(mock_transport, test_tool_str):
             await client.load_tool(REQUESTED_TOOL_NAME)
 
     mock_transport.tool_get_mock.assert_awaited_once_with(REQUESTED_TOOL_NAME, {})
+
+
+@pytest.mark.asyncio
+async def test_load_tool_protocol_fallback_success(test_tool_str):
+    """
+    Tests that the client successfully swaps transports and retries when a
+    ProtocolNegotiationError is raised.
+    """
+    TOOL_NAME = "test_tool_1"
+    manifest = ManifestSchema(serverVersion="0.0.0", tools={TOOL_NAME: test_tool_str})
+
+    from toolbox_core.exceptions import ProtocolNegotiationError
+
+    # We need to mock the transports that client.py will instantiate
+    with (
+        patch("toolbox_core.client.McpHttpTransportV20260728") as mock_2026_cls,
+        patch("toolbox_core.client.McpHttpTransportV20250618") as mock_2025_cls,
+    ):
+
+        mock_2026 = AsyncMock()
+        mock_2026.base_url = TEST_BASE_URL
+        mock_2026.tool_get.side_effect = ProtocolNegotiationError("2025-06-18")
+        mock_2026_cls.return_value = mock_2026
+
+        mock_2025 = AsyncMock()
+        mock_2025.base_url = TEST_BASE_URL
+        mock_2025.tool_get.return_value = manifest
+        mock_2025.tool_invoke.return_value = "ok_from_fallback"
+        mock_2025_cls.return_value = mock_2025
+
+        async with ToolboxClient(TEST_BASE_URL, protocol=Protocol.MCP_DRAFT) as client:
+            # This should trigger the fallback
+            loaded_tool = await client.load_tool(TOOL_NAME)
+
+            # Assert the first transport was closed
+            mock_2026.close.assert_awaited_once()
+
+            # Assert the second transport was instantiated and used
+            mock_2025_cls.assert_called_once()
+            mock_2025.tool_get.assert_awaited_once_with(TOOL_NAME, {})
+
+            # Assert the tool was bound to the *new* transport
+            assert await loaded_tool("some value") == "ok_from_fallback"
+            mock_2025.tool_invoke.assert_awaited_once_with(
+                TOOL_NAME, {"param1": "some value"}, {}
+            )
+
+
+@pytest.mark.asyncio
+async def test_load_tool_protocol_fallback_infinite_loop_prevention(test_tool_str):
+    """
+    Tests that if the fallback transport *also* raises ProtocolNegotiationError,
+    the client does not get stuck in an infinite loop.
+    """
+    TOOL_NAME = "test_tool_1"
+
+    from toolbox_core.exceptions import ProtocolNegotiationError
+
+    with (
+        patch("toolbox_core.client.McpHttpTransportV20260728") as mock_2026_cls,
+        patch("toolbox_core.client.McpHttpTransportV20250618") as mock_2025_cls,
+        patch("toolbox_core.client.McpHttpTransportV20241105") as mock_2024_cls,
+    ):
+
+        mock_2026 = AsyncMock()
+        mock_2026.base_url = TEST_BASE_URL
+        mock_2026.tool_get.side_effect = ProtocolNegotiationError("2025-06-18")
+        mock_2026_cls.return_value = mock_2026
+
+        mock_2025 = AsyncMock()
+        mock_2025.base_url = TEST_BASE_URL
+        # The fallback transport also throws the error trying to fall back to 2024-11-05
+        mock_2025.tool_get.side_effect = ProtocolNegotiationError("2024-11-05")
+        mock_2025_cls.return_value = mock_2025
+
+        mock_2024 = AsyncMock()
+        mock_2024.base_url = TEST_BASE_URL
+        # The 2024-11-05 transport also throws ProtocolNegotiationError("2024-11-05")
+        mock_2024.tool_get.side_effect = ProtocolNegotiationError("2024-11-05")
+        mock_2024_cls.return_value = mock_2024
+
+        async with ToolboxClient(TEST_BASE_URL, protocol=Protocol.MCP_DRAFT) as client:
+            with pytest.raises(
+                ProtocolNegotiationError,
+                match="Server requires protocol fallback to 2024-11-05",
+            ):
+                await client.load_tool(TOOL_NAME)
+
+            # Assert we tried all steps, but then let the exception bubble up instead of looping infinitely
+            mock_2026.tool_get.assert_awaited_once()
+            mock_2025.tool_get.assert_awaited_once()
+            mock_2024.tool_get.assert_awaited_once()
 
 
 class TestAuth:
@@ -726,11 +821,11 @@ async def test_client_init_with_client_info():
 def test_toolbox_client_no_warning_on_mcp():
     """Test that initializing ToolboxClient with Protocol.MCP issues NO DeprecationWarning."""
     # Mock the transport to avoid actual connection attempts or MCP version warnings
-    with patch("toolbox_core.client.McpHttpTransportV20250618") as mock_transport:
+    with patch("toolbox_core.client.McpHttpTransportV20260728") as mock_transport:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
 
-            client = ToolboxClient("http://localhost:5000", protocol=Protocol.MCP)
+            client = ToolboxClient(TOOLBOX_SERVER_URL_STABLE, protocol=Protocol.MCP)
             assert len(w) == 0
 
 
@@ -741,6 +836,347 @@ def test_toolbox_client_no_warning_on_explicit_mcp_version():
             warnings.simplefilter("always")
 
             client = ToolboxClient(
-                "http://localhost:5000", protocol=Protocol.MCP_v20251125
+                TOOLBOX_SERVER_URL_STABLE, protocol=Protocol.MCP_v20251125
             )
             assert len(w) == 0
+
+
+def test_toolbox_client_custom_protocols():
+    """Test that custom protocols array is correctly parsed and sorted."""
+    with patch("toolbox_core.client._McpTransportProxy") as mock_proxy:
+        client = ToolboxClient(
+            TOOLBOX_SERVER_URL_STABLE,
+            protocol=[Protocol.MCP_v20241105, Protocol.MCP_DRAFT, "2025-06-18"],
+        )
+        mock_proxy.assert_called_once()
+        args, kwargs = mock_proxy.call_args
+
+        # Check initial_protocol
+        assert args[2] == Protocol.MCP_DRAFT
+        # Check supported_protocols (must be sorted from newest to oldest)
+        assert args[6] == ["2026-07-28", "2025-06-18", "2024-11-05"]
+
+
+def test_toolbox_client_custom_protocols_invalid():
+    """Test that custom protocols array raises error when no valid protocols are found."""
+
+    with pytest.raises(ValueError, match="protocol list cannot be empty"):
+        ToolboxClient(TOOLBOX_SERVER_URL_STABLE, protocol=[])
+
+    with pytest.raises(ValueError, match="No supported protocol version found"):
+        ToolboxClient(TOOLBOX_SERVER_URL_STABLE, protocol=["invalid-version"])
+
+
+def test_toolbox_client_custom_protocols_unrecognized_warning(caplog):
+    """Test that custom protocols list with unrecognized versions logs a warning and proceeds with valid ones."""
+    with patch("toolbox_core.client._McpTransportProxy") as mock_proxy:
+        with caplog.at_level("WARNING"):
+            client = ToolboxClient(
+                TOOLBOX_SERVER_URL_STABLE,
+                protocol=["UNSUPPORTED-FUTURE-PROTOCOL-v99", Protocol.MCP_v20251125],
+            )
+            mock_proxy.assert_called_once()
+            args, _ = mock_proxy.call_args
+
+            # Verify warning was logged
+            assert (
+                "Ignoring unrecognized protocol version(s) in request list: ['UNSUPPORTED-FUTURE-PROTOCOL-v99']"
+                in caplog.text
+            )
+
+            # Verify initial_protocol was resolved to the valid protocol
+            assert args[2] == Protocol.MCP_v20251125
+            assert args[6] == ["2025-11-25"]
+
+
+@pytest.mark.asyncio
+async def test_artificial_array():
+    """The Artificial Array Test: simulate server returning 2025-03-26, should fallback to 2024-11-05."""
+    proxy = _McpTransportProxy(
+        "http://mock",
+        None,
+        Protocol.MCP_DRAFT,
+        None,
+        None,
+        False,
+        [Protocol.MCP_DRAFT.value, Protocol.MCP_v20241105.value],
+    )
+
+    proxy._active_transport.tool_get = AsyncMock(
+        side_effect=ProtocolNegotiationError(Protocol.MCP_v20250326.value)
+    )
+
+    with patch.object(proxy, "_create_transport") as mock_create:
+        mock_new_transport = AsyncMock()
+        mock_new_transport.tool_get.return_value = "success"
+        mock_create.return_value = mock_new_transport
+
+        res = await proxy.tool_get("mock")
+
+        assert res == "success"
+        mock_create.assert_called_with(Protocol.MCP_v20241105)
+
+
+@pytest.mark.asyncio
+async def test_cascading_fallback():
+    """The Cascading Fallback Test: simulate server stateless generic error which throws the next stateful version."""
+    proxy = _McpTransportProxy(
+        "http://mock",
+        None,
+        Protocol.MCP_DRAFT,
+        None,
+        None,
+        False,
+        [Protocol.MCP_DRAFT.value, Protocol.MCP_v20251125.value],
+    )
+
+    proxy._active_transport.tool_get = AsyncMock(
+        side_effect=ProtocolNegotiationError(Protocol.MCP_v20251125.value)
+    )
+
+    with patch.object(proxy, "_create_transport") as mock_create:
+        mock_new_transport = AsyncMock()
+        mock_new_transport.tool_get.return_value = "success"
+        mock_create.return_value = mock_new_transport
+
+        res = await proxy.tool_get("mock")
+
+        assert res == "success"
+        mock_create.assert_called_with(Protocol.MCP_v20251125)
+
+
+@pytest.mark.asyncio
+async def test_strict_constraint():
+    """The Strict Constraint Test: simulate legacy server returning an unsupported old version."""
+    proxy = _McpTransportProxy(
+        "http://mock",
+        None,
+        Protocol.MCP_DRAFT,
+        None,
+        None,
+        False,
+        [Protocol.MCP_DRAFT.value, Protocol.MCP_v20251125.value],
+    )
+
+    proxy._active_transport.tool_get = AsyncMock(
+        side_effect=ProtocolNegotiationError(Protocol.MCP_v20241105.value)
+    )
+
+    with pytest.raises(RuntimeError, match="No mutually supported protocol version"):
+        await proxy.tool_get("mock")
+
+
+@pytest.mark.asyncio
+async def test_modern_smart_fallback():
+    """The Modern Smart-Fallback Test: simulate modern payload correctly returning pre-intersected fallback."""
+    proxy = _McpTransportProxy(
+        "http://mock",
+        None,
+        Protocol.MCP_DRAFT,
+        None,
+        None,
+        False,
+        [Protocol.MCP_DRAFT.value, Protocol.MCP_v20241105.value],
+    )
+
+    proxy._active_transport.tool_get = AsyncMock(
+        side_effect=ProtocolNegotiationError(Protocol.MCP_v20241105.value)
+    )
+
+    with patch.object(proxy, "_create_transport") as mock_create:
+        mock_new_transport = AsyncMock()
+        mock_new_transport.tool_get.return_value = "success"
+        mock_create.return_value = mock_new_transport
+
+        res = await proxy.tool_get("mock")
+
+        assert res == "success"
+        mock_create.assert_called_with(Protocol.MCP_v20241105)
+
+
+@pytest.mark.asyncio
+async def test_multistep_cascading_fallback():
+    """Multi-step Cascading Fallback Test across three transport versions (Draft -> 20251125 -> 20241105)."""
+    proxy = _McpTransportProxy(
+        "http://mock",
+        None,
+        Protocol.MCP_DRAFT,
+        None,
+        None,
+        False,
+        [
+            Protocol.MCP_DRAFT.value,
+            Protocol.MCP_v20251125.value,
+            Protocol.MCP_v20241105.value,
+        ],
+    )
+
+    t1 = AsyncMock()
+    t1.tool_get.side_effect = ProtocolNegotiationError(Protocol.MCP_v20251125.value)
+
+    t2 = AsyncMock()
+    t2.tool_get.side_effect = ProtocolNegotiationError(Protocol.MCP_v20241105.value)
+
+    t3 = AsyncMock()
+    t3.tool_get.return_value = "success"
+
+    proxy._active_transport = t1
+
+    with patch.object(proxy, "_create_transport") as mock_create:
+        mock_create.side_effect = [t2, t3]
+
+        res = await proxy.tool_get("mock")
+
+        assert res == "success"
+        assert mock_create.call_count == 2
+        assert mock_create.call_args_list[0][0][0] == Protocol.MCP_v20251125
+        assert mock_create.call_args_list[1][0][0] == Protocol.MCP_v20241105
+
+
+class TestClientSecureParams:
+    """Tests for secure parameters support in ToolboxClient."""
+
+    @pytest.mark.asyncio
+    async def test_load_tool_with_secure_params_success(self, mock_transport):
+        schema = ToolSchema(
+            description="A tool with secure parameters",
+            parameters=[
+                ParameterSchema(
+                    name="query",
+                    type="string",
+                    description="search query",
+                    required=True,
+                )
+            ],
+            secure_parameters=[
+                ParameterSchema(
+                    name="api_token",
+                    type="string",
+                    description="API Token",
+                    required=True,
+                )
+            ],
+        )
+        mock_transport.tool_get_mock.return_value = ManifestSchema(
+            serverVersion="1.0.0", tools={"my_tool": schema}
+        )
+
+        client = ToolboxClient(TEST_BASE_URL)
+        client._ToolboxClient__transport = mock_transport
+
+        tool = await client.load_tool(
+            "my_tool",
+            secure_params={"api_token": "token-123"},
+        )
+
+        assert tool._bound_secure_params == {"api_token": "token-123"}
+        assert len(tool._secure_params) == 0
+
+    @pytest.mark.asyncio
+    async def test_load_tool_with_unused_secure_params_raises(self, mock_transport):
+        schema = ToolSchema(
+            description="A tool with secure parameters",
+            parameters=[
+                ParameterSchema(
+                    name="query",
+                    type="string",
+                    description="search query",
+                    required=True,
+                )
+            ],
+            secure_parameters=[
+                ParameterSchema(
+                    name="api_token",
+                    type="string",
+                    description="API Token",
+                    required=True,
+                )
+            ],
+        )
+        mock_transport.tool_get_mock.return_value = ManifestSchema(
+            serverVersion="1.0.0", tools={"my_tool": schema}
+        )
+
+        client = ToolboxClient(TEST_BASE_URL)
+        client._ToolboxClient__transport = mock_transport
+
+        with pytest.raises(
+            ValueError,
+            match=r"Validation failed for tool 'my_tool': unused secure parameters: extra_token\.",
+        ):
+            await client.load_tool(
+                "my_tool",
+                secure_params={"api_token": "token-123", "extra_token": "extra"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_load_toolset_with_secure_params_success(self, mock_transport):
+        schema1 = ToolSchema(
+            description="Tool 1",
+            parameters=[],
+            secure_parameters=[
+                ParameterSchema(
+                    name="api_token",
+                    type="string",
+                    description="API Token",
+                    required=True,
+                )
+            ],
+        )
+        schema2 = ToolSchema(
+            description="Tool 2",
+            parameters=[],
+            secure_parameters=[
+                ParameterSchema(
+                    name="db_pass",
+                    type="string",
+                    description="DB Password",
+                    required=False,
+                )
+            ],
+        )
+        mock_transport.tools_list_mock.return_value = ManifestSchema(
+            serverVersion="1.0.0", tools={"tool1": schema1, "tool2": schema2}
+        )
+
+        client = ToolboxClient(TEST_BASE_URL)
+        client._ToolboxClient__transport = mock_transport
+
+        tools = await client.load_toolset(
+            "my_set",
+            secure_params={"api_token": "token-123", "db_pass": "pass-123"},
+        )
+
+        assert len(tools) == 2
+        assert tools[0]._bound_secure_params == {"api_token": "token-123"}
+        assert tools[1]._bound_secure_params == {"db_pass": "pass-123"}
+
+    @pytest.mark.asyncio
+    async def test_load_toolset_with_unused_secure_params_raises(self, mock_transport):
+        schema1 = ToolSchema(
+            description="Tool 1",
+            parameters=[],
+            secure_parameters=[
+                ParameterSchema(
+                    name="api_token",
+                    type="string",
+                    description="API Token",
+                    required=True,
+                )
+            ],
+        )
+        mock_transport.tools_list_mock.return_value = ManifestSchema(
+            serverVersion="1.0.0", tools={"tool1": schema1}
+        )
+
+        client = ToolboxClient(TEST_BASE_URL)
+        client._ToolboxClient__transport = mock_transport
+
+        with pytest.raises(
+            ValueError,
+            match=r"Validation failed for toolset 'my_set': unused secure parameters could not be applied to any tool: unused_sec\.",
+        ):
+            await client.load_toolset(
+                "my_set",
+                secure_params={"api_token": "token-123", "unused_sec": "unused"},
+            )

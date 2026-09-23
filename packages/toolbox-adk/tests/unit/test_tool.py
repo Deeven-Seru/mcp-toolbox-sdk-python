@@ -17,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from google.genai.types import Type
 from pydantic import ValidationError
+from toolbox_core.protocol import TelemetryAttributes
 
+from toolbox_adk.client import USER_TOKEN_CONTEXT_VAR
 from toolbox_adk.credentials import CredentialConfig, CredentialType
 from toolbox_adk.tool import ToolboxTool
 
@@ -165,6 +167,92 @@ class TestToolboxTool:
         assert bound_getters["service2"]() == "dynamic_token2"
 
     @pytest.mark.asyncio
+    async def test_dynamic_telemetry_attributes_resolved_per_invocation(self):
+        core_tool = AsyncMock()
+        core_tool.__name__ = "mock"
+        core_tool.__doc__ = "mock doc"
+
+        derived_tools = []
+
+        def add_telemetry_attributes(attrs):
+            derived_tool = AsyncMock(return_value=f"ok-{attrs.user_id}")
+            derived_tool.__name__ = "mock"
+            derived_tool.__doc__ = "mock doc"
+            derived_tools.append(derived_tool)
+            return derived_tool
+
+        core_tool.add_telemetry_attributes = MagicMock(
+            side_effect=add_telemetry_attributes
+        )
+
+        def telemetry_getter(ctx):
+            return TelemetryAttributes(
+                llm_model="gemini-3.5-flash",
+                user_id=ctx.state["user_id"],
+                agent_id="agent-1",
+            )
+
+        tool = ToolboxTool(core_tool, telemetry_attributes=telemetry_getter)
+
+        ctx1 = MagicMock()
+        ctx1.state = {"user_id": "user-1"}
+        ctx2 = MagicMock()
+        ctx2.state = {"user_id": "user-2"}
+
+        assert await tool.run_async({}, ctx1) == "ok-user-1"
+        assert await tool.run_async({}, ctx2) == "ok-user-2"
+
+        calls = core_tool.add_telemetry_attributes.call_args_list
+        assert [c.args[0].user_id for c in calls] == ["user-1", "user-2"]
+        assert all(c.args[0].llm_model == "gemini-3.5-flash" for c in calls)
+        assert core_tool.await_count == 0
+        assert [t.await_count for t in derived_tools] == [1, 1]
+        assert tool._core_tool is core_tool
+
+    @pytest.mark.asyncio
+    async def test_telemetry_getter_with_default_argument_receives_tool_context(self):
+        core_tool = AsyncMock()
+        core_tool.__name__ = "mock"
+        core_tool.__doc__ = "mock doc"
+
+        derived_tool = AsyncMock(return_value="ok")
+        derived_tool.__name__ = "mock"
+        derived_tool.__doc__ = "mock doc"
+        core_tool.add_telemetry_attributes = MagicMock(return_value=derived_tool)
+
+        def telemetry_getter(ctx, default_model="gemini-3.5-flash"):
+            return TelemetryAttributes(
+                llm_model=default_model,
+                user_id=ctx.state["user_id"],
+                agent_id="agent-1",
+            )
+
+        tool = ToolboxTool(core_tool, telemetry_attributes=telemetry_getter)
+
+        ctx = MagicMock()
+        ctx.state = {"user_id": "user-1"}
+
+        assert await tool.run_async({}, ctx) == "ok"
+
+        attrs = core_tool.add_telemetry_attributes.call_args.args[0]
+        assert attrs.llm_model == "gemini-3.5-flash"
+        assert attrs.user_id == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_telemetry_getter_return_type_raises(self):
+        core_tool = AsyncMock()
+        core_tool.__name__ = "mock"
+        core_tool.__doc__ = "mock doc"
+
+        tool = ToolboxTool(core_tool, telemetry_attributes=lambda: {"user_id": "u1"})
+
+        with pytest.raises(
+            TypeError,
+            match="telemetry_attributes callable must return TelemetryAttributes or None",
+        ):
+            await tool.run_async({}, MagicMock())
+
+    @pytest.mark.asyncio
     async def test_3lo_missing_client_secret(self):
         # Test ValueError when client_id/secret missing
         core_tool = AsyncMock()
@@ -275,6 +363,48 @@ class TestToolboxTool:
             "profile": "",
             "email": "",
         }
+
+    @pytest.mark.asyncio
+    async def test_3lo_resets_user_token_when_telemetry_getter_raises(self):
+        core_tool = AsyncMock(return_value="success")
+        core_tool.__name__ = "mock_tool"
+        core_tool.__doc__ = "mock doc"
+        core_tool._required_authn_params = {"mock_param": "mock_service"}
+        core_tool._required_authz_tokens = []
+        core_tool.add_auth_token_getter = MagicMock(return_value=core_tool)
+
+        auth_config = CredentialConfig(
+            type=CredentialType.USER_IDENTITY, client_id="cid", client_secret="csec"
+        )
+
+        def telemetry_getter(ctx):
+            raise RuntimeError("telemetry boom")
+
+        tool = ToolboxTool(
+            core_tool, auth_config=auth_config, telemetry_attributes=telemetry_getter
+        )
+
+        ctx = MagicMock()
+        mock_creds = MagicMock()
+        mock_creds.oauth2.access_token = "valid_access_token"
+        mock_creds.oauth2.id_token = "valid_id_token"
+        ctx.get_auth_response.return_value = mock_creds
+
+        mock_cred_service = MagicMock()
+        mock_cred_service.load_credential = AsyncMock(return_value=None)
+        mock_cred_service.save_credential = AsyncMock(return_value=None)
+        ctx._invocation_context = MagicMock()
+        ctx._invocation_context.credential_service = mock_cred_service
+
+        previous_token = USER_TOKEN_CONTEXT_VAR.set("previous_token")
+        try:
+            with pytest.raises(RuntimeError, match="telemetry boom"):
+                await tool.run_async({}, ctx)
+
+            assert USER_TOKEN_CONTEXT_VAR.get() == "previous_token"
+            core_tool.assert_not_awaited()
+        finally:
+            USER_TOKEN_CONTEXT_VAR.reset(previous_token)
 
     @pytest.mark.asyncio
     async def test_3lo_exception_reraise(self):
@@ -462,3 +592,52 @@ class TestToolboxTool:
         tool = ToolboxTool(core_tool)
         assert tool.name == "valid_tool"
         assert tool.description == "valid description"
+
+    def test_bind_param(self):
+        core_tool = MagicMock()
+        core_tool.__name__ = "valid_tool"
+        core_tool.__doc__ = "valid doc"
+        new_core_tool = MagicMock()
+        new_core_tool.__name__ = "valid_tool"
+        new_core_tool.__doc__ = "valid doc"
+        core_tool.bind_params.return_value = new_core_tool
+
+        tool = ToolboxTool(core_tool)
+        bound_tool = tool.bind_param("param_a", "val_a")
+
+        core_tool.bind_params.assert_called_once_with({"param_a": "val_a"})
+        assert isinstance(bound_tool, ToolboxTool)
+        assert bound_tool._core_tool is new_core_tool
+
+    def test_bind_secure_param(self):
+        core_tool = MagicMock()
+        core_tool.__name__ = "valid_tool"
+        core_tool.__doc__ = "valid doc"
+        new_core_tool = MagicMock()
+        new_core_tool.__name__ = "valid_tool"
+        new_core_tool.__doc__ = "valid doc"
+        core_tool.bind_secure_params.return_value = new_core_tool
+
+        tool = ToolboxTool(core_tool)
+        bound_tool = tool.bind_secure_param("api_key", "secret123")
+
+        core_tool.bind_secure_params.assert_called_once_with({"api_key": "secret123"})
+        assert isinstance(bound_tool, ToolboxTool)
+        assert bound_tool._core_tool is new_core_tool
+
+    def test_bind_secure_params(self):
+        core_tool = MagicMock()
+        core_tool.__name__ = "valid_tool"
+        core_tool.__doc__ = "valid doc"
+        new_core_tool = MagicMock()
+        new_core_tool.__name__ = "valid_tool"
+        new_core_tool.__doc__ = "valid doc"
+        core_tool.bind_secure_params.return_value = new_core_tool
+
+        tool = ToolboxTool(core_tool)
+        sec_dict = {"api_key": "secret123", "db_pass": "pass"}
+        bound_tool = tool.bind_secure_params(sec_dict)
+
+        core_tool.bind_secure_params.assert_called_once_with(sec_dict)
+        assert isinstance(bound_tool, ToolboxTool)
+        assert bound_tool._core_tool is new_core_tool

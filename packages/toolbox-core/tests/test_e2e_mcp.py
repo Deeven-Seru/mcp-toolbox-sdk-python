@@ -19,18 +19,24 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
+from tests.constants import TOOLBOX_SERVER_URL_DRAFT, TOOLBOX_SERVER_URL_STABLE
 from toolbox_core.client import ToolboxClient
 from toolbox_core.protocol import Protocol
 from toolbox_core.tool import ToolboxTool
 
+pytestmark = pytest.mark.usefixtures("patch_toolbox_client_url")
+
 
 @pytest_asyncio.fixture(
     scope="function",
-    params=Protocol.get_supported_mcp_versions(),
+    params=[v for v in Protocol.get_supported_mcp_versions()],
 )
 async def toolbox(request):
     """Creates a ToolboxClient instance shared by all tests in this module."""
-    toolbox = ToolboxClient("http://localhost:5000", protocol=Protocol(request.param))
+    # Note: The STABLE URL passed here is automatically patched by the
+    # 'patch_toolbox_client_url' fixture to run against both
+    # the STABLE (5000) and DRAFT (5001) servers.
+    toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE, protocol=Protocol(request.param))
     try:
         yield toolbox
     finally:
@@ -71,7 +77,6 @@ class TestBasicE2E:
     async def test_load_toolset_default(self, toolbox: ToolboxClient):
         """Load the default toolset, i.e. all tools."""
         toolset = await toolbox.load_toolset()
-        assert len(toolset) == 7
         tool_names = {tool.__name__ for tool in toolset}
         expected_tools = [
             "get-row-by-content-auth",
@@ -82,6 +87,14 @@ class TestBasicE2E:
             "search-rows",
             "process-data",
         ]
+
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            expected_tools.append("my-secure-tool")
+
+        assert len(toolset) == len(expected_tools)
         assert tool_names == set(expected_tools)
 
     async def test_run_tool(self, get_n_rows_tool: ToolboxTool):
@@ -97,6 +110,71 @@ class TestBasicE2E:
         """Invoke a tool with missing params."""
         with pytest.raises(TypeError, match="missing a required argument: 'num_rows'"):
             await get_n_rows_tool()
+
+    async def test_run_tool_url_binding(self):
+        """Tests URL Parameter Binding natively handled by the server."""
+        async with ToolboxClient(f"{TOOLBOX_SERVER_URL_STABLE}?num_rows=2") as toolbox:
+            tool = await toolbox.load_tool("get-n-rows")
+
+            # 'num_rows' is filtered from the schema and automatically injected by the server
+            response = await tool()
+
+            assert isinstance(response, str)
+            assert "row1" in response
+            assert "row2" in response
+            assert "row3" not in response
+
+    async def test_protocol_fallback_e2e(
+        self, toolbox_server_url: str, caplog: pytest.LogCaptureFixture
+    ):
+        """Tests that a client requesting an unsupported protocol version falls back to a supported version."""
+        # 1. Verify warning log and fallback for unrecognized protocol strings in list
+        with caplog.at_level("WARNING"):
+            async with ToolboxClient(
+                toolbox_server_url,
+                protocol=["UNSUPPORTED-FUTURE-PROTOCOL-v99", Protocol.MCP_LATEST],
+            ) as client:
+                tool = await client.load_tool("get-n-rows")
+                response = await tool(num_rows="1")
+                assert "row1" in response
+                assert (
+                    client._ToolboxClient__transport._protocol_version
+                    == Protocol.MCP_LATEST.value
+                )
+                assert (
+                    "Ignoring unrecognized protocol version(s) in request list: ['UNSUPPORTED-FUTURE-PROTOCOL-v99']"
+                    in caplog.text
+                )
+
+        # 2. Verify server fallback behavior when using MCP_DRAFT
+        async with ToolboxClient(
+            toolbox_server_url, protocol=Protocol.MCP_DRAFT
+        ) as client:
+            tool = await client.load_tool("get-n-rows")
+            response = await tool(num_rows="1")
+            assert "row1" in response
+
+            if Protocol.MCP_DRAFT == Protocol.MCP_LATEST:
+                # Currently, no active draft spec exists (MCP_DRAFT == MCP_LATEST == 2026-07-28),
+                # so both stable and draft servers support the protocol natively without HTTP 400 fallback.
+                assert (
+                    client._ToolboxClient__transport._protocol_version
+                    == Protocol.MCP_DRAFT.value
+                )
+            else:
+                # When a future experimental draft version exists (e.g. DRAFT-2027-v1):
+                if toolbox_server_url == TOOLBOX_SERVER_URL_DRAFT:
+                    # Draft server (5001) supports the new draft version
+                    assert (
+                        client._ToolboxClient__transport._protocol_version
+                        == Protocol.MCP_DRAFT.value
+                    )
+                else:
+                    # Stable server (5000) rejects the new draft version and triggers HTTP 400 fallback
+                    assert (
+                        client._ToolboxClient__transport._protocol_version
+                        != Protocol.MCP_DRAFT.value
+                    )
 
     async def test_run_tool_wrong_param_type(self, get_n_rows_tool: ToolboxTool):
         """Invoke a tool with wrong param type."""
@@ -166,11 +244,14 @@ class TestAuth:
         requires a different authentication than the one provided."""
         tool = await toolbox.load_tool("get-row-by-id-auth")
         auth_tool = tool.add_auth_token_getters({"my-test-auth": lambda: auth_token2})
-        with pytest.raises(
-            Exception,
-            match=r"401 \(Unauthorized\)",
-        ):
+        try:
             await auth_tool(id="2")
+            pytest.fail("Expected tool to fail with auth error")
+        except Exception as e:
+            err_str = str(e)
+            assert (
+                "401" in err_str or "-32600" in err_str
+            ), f"Unexpected error message: {err_str}"
 
     async def test_run_tool_auth(self, toolbox: ToolboxClient, auth_token1: str):
         """Tests running a tool with correct auth."""
@@ -221,11 +302,8 @@ class TestAuth:
             "get-row-by-content-auth",
             auth_token_getters={"my-test-auth": lambda: auth_token1},
         )
-        with pytest.raises(
-            Exception,
-            match="no field named row_data in claims",
-        ):
-            await tool()
+        response = await tool()
+        assert "no field named row_data in claims" in response
 
 
 @pytest.mark.asyncio
@@ -446,3 +524,267 @@ class TestMapParams:
                 execution_context={"env": "staging"},
                 user_scores={"user4": "not-an-integer"},
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+async def test_mcp_default_protocol(toolbox_server_url: str):
+    """Verify that omitting the protocol argument defaults correctly and works."""
+    async with ToolboxClient(toolbox_server_url) as client:
+        tool = await client.load_tool("get-n-rows")
+        response = await tool(num_rows="1")
+        assert "row1" in response
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+async def test_mcp_draft_fallback(toolbox_server_url: str):
+    """Verify that explicitly using MCP_DRAFT against a server that doesn't support it falls back successfully.
+
+    Note: When MCP_DRAFT == MCP_LATEST (no unreleased draft spec), both stable (5000) and draft (5001)
+    servers support the protocol natively. When a future experimental draft version (e.g. DRAFT-2027-v1)
+    is introduced, stable servers (5000) will reject it with HTTP 400, automatically triggering fallback
+    to MCP_LATEST.
+    """
+    async with ToolboxClient(toolbox_server_url, protocol=Protocol.MCP_DRAFT) as client:
+        tool = await client.load_tool("get-n-rows")
+        response = await tool(num_rows="1")
+        assert "row1" in response
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+async def test_mcp_latest_protocol(toolbox_server_url: str):
+    """Verify that explicitly using MCP_LATEST works successfully."""
+    async with ToolboxClient(
+        toolbox_server_url, protocol=Protocol.MCP_LATEST
+    ) as client:
+        tool = await client.load_tool("get-n-rows")
+        response = await tool(num_rows="1")
+        assert "row1" in response
+        assert (
+            client._ToolboxClient__transport._protocol_version
+            == Protocol.MCP_LATEST.value
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+async def test_mcp_custom_protocols_list(toolbox_server_url: str):
+    """Verify that passing a list of protocols with MCP_LATEST and MCP_DRAFT works successfully."""
+    async with ToolboxClient(
+        toolbox_server_url,
+        protocol=[
+            Protocol.MCP_v20241105,
+            Protocol.MCP_v20250326,
+            Protocol.MCP_LATEST,
+            Protocol.MCP_DRAFT,
+        ],
+    ) as client:
+        tool = await client.load_tool("get-n-rows")
+        response = await tool(num_rows="1")
+        assert "row1" in response
+        # When MCP_DRAFT == MCP_LATEST, both assertions evaluate to MCP_LATEST.value.
+        # When a future draft (e.g. DRAFT-2027-v1) is introduced, the stable server (5000)
+        # falls back to MCP_LATEST while the draft server (5001) negotiates MCP_DRAFT.
+        if toolbox_server_url == TOOLBOX_SERVER_URL_STABLE:
+            assert (
+                client._ToolboxClient__transport._protocol_version
+                == Protocol.MCP_LATEST.value
+            )
+        else:
+            assert (
+                client._ToolboxClient__transport._protocol_version
+                == Protocol.MCP_DRAFT.value
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("toolbox_server")
+class TestSecureParamsE2E:
+    async def test_run_tool_with_secure_param(self, toolbox: ToolboxClient):
+        """Tests loading and invoking a tool with a secure parameter."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_param("name", "Alice")
+        response = await bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_run_tool_with_secure_params_plural(self, toolbox: ToolboxClient):
+        """Tests batch binding with bind_secure_params."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_params({"name": "Alice"})
+        response = await bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_run_tool_with_secure_param_callable_sync(
+        self, toolbox: ToolboxClient
+    ):
+        """Tests dynamic sync callable resolution during live tool execution."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_param("name", lambda: "Alice")
+        response = await bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_run_tool_with_secure_param_callable_async(
+        self, toolbox: ToolboxClient
+    ):
+        """Tests dynamic async coroutine resolution during live tool execution."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+
+        async def fetch_secret():
+            return "Alice"
+
+        bound_tool = tool.bind_secure_param("name", fetch_secret)
+        response = await bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_secure_param_callable_exception_propagates(
+        self, toolbox: ToolboxClient
+    ):
+        """Tests that exceptions in dynamic callables propagate to caller."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+
+        def failing_secret():
+            raise PermissionError("token expired")
+
+        bound_tool = tool.bind_secure_param("name", failing_secret)
+        with pytest.raises(PermissionError, match="token expired"):
+            await bound_tool(id=1)
+
+    async def test_load_tool_with_secure_params(self, toolbox: ToolboxClient):
+        """Tests load_tool with secure_params passed during loading."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool(
+                    "my-secure-tool", secure_params={"name": "Alice"}
+                )
+            return
+
+        tool = await toolbox.load_tool(
+            "my-secure-tool", secure_params={"name": "Alice"}
+        )
+        response = await tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_load_toolset_with_secure_params(self, toolbox: ToolboxClient):
+        """Tests load_toolset with secure_params distributed across tools."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            toolset = await toolbox.load_toolset("my-secure-toolset")
+            assert len(toolset) == 0
+            return
+
+        toolset = await toolbox.load_toolset(
+            "my-secure-toolset", secure_params={"name": "Alice"}
+        )
+        by_name = {t.__name__: t for t in toolset}
+        assert "my-secure-tool" in by_name
+        tool = by_name["my-secure-tool"]
+        response = await tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    async def test_secure_param_schema_isolation_e2e(self, toolbox: ToolboxClient):
+        """Tests that secure parameters from server are stripped from __signature__ and docstring."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+        sig = signature(tool)
+        assert "id" in sig.parameters
+        assert "name" not in sig.parameters
+        assert "name" not in (tool.__doc__ or "")
+
+    @pytest.mark.parametrize(
+        ("method_name", "param_name", "param_val", "expected_match"),
+        [
+            (
+                "bind_param",
+                "name",
+                "Alice",
+                "parameter 'name' is a secure parameter; use bind_secure_param/bind_secure_params instead",
+            ),
+            (
+                "bind_secure_param",
+                "id",
+                1,
+                "parameter 'id' is a regular parameter; use bind_param/bind_params instead",
+            ),
+        ],
+    )
+    async def test_cross_binding_guidance_error(
+        self,
+        toolbox: ToolboxClient,
+        method_name: str,
+        param_name: str,
+        param_val: Any,
+        expected_match: str,
+    ):
+        """Tests that cross-binding (bind_param on secure or bind_secure_param on regular) raises guidance error."""
+        protocol_version = toolbox._ToolboxClient__transport._protocol_version
+        if not Protocol._is_version_at_least(
+            protocol_version, Protocol.MCP_v20260728.value
+        ):
+            with pytest.raises(ValueError, match="Tool 'my-secure-tool' not found"):
+                await toolbox.load_tool("my-secure-tool")
+            return
+
+        tool = await toolbox.load_tool("my-secure-tool")
+        method = getattr(tool, method_name)
+        with pytest.raises(ValueError, match=expected_match):
+            method(param_name, param_val)

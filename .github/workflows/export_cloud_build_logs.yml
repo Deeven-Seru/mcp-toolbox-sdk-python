@@ -16,8 +16,6 @@ name: Export Cloud Build Failure Logs
 permissions: 
   contents: read
   checks: read
-  issues: write 
-  pull-requests: write 
 
 on:
   check_suite:
@@ -37,7 +35,9 @@ jobs:
       pr_number: ${{ steps.detect_pr_number.outputs.pr_number }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Install GitHub CLI
         run: sudo apt-get update && sudo apt-get install -y gh
@@ -148,6 +148,9 @@ jobs:
   post-pr-comment:
     needs: [detect-build-failure, process-failed-builds]
     runs-on: ubuntu-latest
+    permissions:
+      issues: write 
+      pull-requests: write 
     if: always()
     steps:
       - name: Compose and post PR comment with artifact links

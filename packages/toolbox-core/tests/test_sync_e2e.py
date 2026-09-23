@@ -14,15 +14,21 @@
 
 import pytest
 
+from tests.constants import TOOLBOX_SERVER_URL_STABLE
 from toolbox_core.sync_client import ToolboxSyncClient
 from toolbox_core.sync_tool import ToolboxSyncTool
+
+pytestmark = pytest.mark.usefixtures("patch_toolbox_client_url")
 
 
 # --- Shared Fixtures Defined at Module Level ---
 @pytest.fixture(scope="module")
 def toolbox():
     """Creates a ToolboxSyncClient instance shared by all tests in this module."""
-    toolbox = ToolboxSyncClient("http://localhost:5000")
+    # Note: The STABLE URL passed here is automatically patched by the
+    # 'patch_toolbox_client_url' fixture to run against both
+    # the STABLE (5000) and DRAFT (5001) servers.
+    toolbox = ToolboxSyncClient(TOOLBOX_SERVER_URL_STABLE)
     try:
         yield toolbox
     finally:
@@ -72,6 +78,19 @@ class TestBasicE2E:
         """Invoke a tool with missing params."""
         with pytest.raises(TypeError, match="missing a required argument: 'num_rows'"):
             get_n_rows_tool()
+
+    def test_run_tool_url_binding(self):
+        """Tests URL Parameter Binding natively handled by the server."""
+        with ToolboxSyncClient(f"{TOOLBOX_SERVER_URL_STABLE}?num_rows=2") as toolbox:
+            tool = toolbox.load_tool("get-n-rows")
+
+            # 'num_rows' is filtered from the schema and automatically injected by the server
+            response = tool()
+
+            assert isinstance(response, str)
+            assert "row1" in response
+            assert "row2" in response
+            assert "row3" not in response
 
     def test_run_tool_wrong_param_type(self, get_n_rows_tool: ToolboxSyncTool):
         """Invoke a tool with wrong param type."""
@@ -180,8 +199,51 @@ class TestAuth:
             "get-row-by-content-auth",
             auth_token_getters={"my-test-auth": lambda: auth_token1},
         )
-        with pytest.raises(
-            Exception,
-            match="no field named row_data in claims",
-        ):
-            tool()
+        response = tool()
+        assert "no field named row_data in claims" in response
+
+
+@pytest.mark.usefixtures("toolbox_server")
+class TestSyncSecureParamsE2E:
+    def test_sync_run_tool_with_secure_param(self, toolbox: ToolboxSyncClient):
+        """Tests synchronous loading and invoking a tool with a secure parameter."""
+        tool = toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_param("name", "Alice")
+        response = bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    def test_sync_run_tool_with_secure_params_plural(self, toolbox: ToolboxSyncClient):
+        """Tests synchronous batch binding with bind_secure_params."""
+        tool = toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_params({"name": "Alice"})
+        response = bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    def test_sync_run_tool_with_secure_param_callable(self, toolbox: ToolboxSyncClient):
+        """Tests synchronous loading and invoking a tool with a dynamic callable secure parameter."""
+        tool = toolbox.load_tool("my-secure-tool")
+        bound_tool = tool.bind_secure_param("name", lambda: "Alice")
+        response = bound_tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    def test_sync_load_tool_with_secure_params(self, toolbox: ToolboxSyncClient):
+        """Tests synchronous load_tool with secure_params passed during loading."""
+        tool = toolbox.load_tool("my-secure-tool", secure_params={"name": "Alice"})
+        response = tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response
+
+    def test_sync_load_toolset_with_secure_params(self, toolbox: ToolboxSyncClient):
+        """Tests synchronous load_toolset with secure_params distributed across tools."""
+        toolset = toolbox.load_toolset(
+            "my-secure-toolset", secure_params={"name": "Alice"}
+        )
+        by_name = {t.__name__: t for t in toolset}
+        assert "my-secure-tool" in by_name
+        tool = by_name["my-secure-tool"]
+        response = tool(id=1)
+        assert isinstance(response, str)
+        assert "Alice" in response

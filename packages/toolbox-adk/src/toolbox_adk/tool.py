@@ -14,14 +14,10 @@
 
 import inspect
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Union, cast
 
 import toolbox_core
-from fastapi.openapi.models import (
-    OAuth2,
-    OAuthFlowAuthorizationCode,
-    OAuthFlows,
-)
+from fastapi.openapi.models import OAuth2, OAuthFlowAuthorizationCode, OAuthFlows
 from google.adk.auth.auth_credential import (
     AuthCredential,
     AuthCredentialTypes,
@@ -32,7 +28,11 @@ from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai.types import FunctionDeclaration, Schema, Type
 from pydantic import ValidationError
-from toolbox_core.protocol import AdditionalPropertiesSchema, ParameterSchema
+from toolbox_core.protocol import (
+    AdditionalPropertiesSchema,
+    ParameterSchema,
+    TelemetryAttributes,
+)
 from toolbox_core.tool import ToolboxTool as CoreToolboxTool
 from typing_extensions import override
 
@@ -48,12 +48,28 @@ class ToolboxTool(BaseTool):
         core_tool: CoreToolboxTool,
         auth_config: Optional[CredentialConfig] = None,
         adk_token_getters: Optional[Mapping[str, Any]] = None,
+        telemetry_attributes: Optional[
+            Union[
+                TelemetryAttributes,
+                Callable[[], TelemetryAttributes],
+                Callable[[ToolContext], TelemetryAttributes],
+                Callable[[], Awaitable[TelemetryAttributes]],
+                Callable[[ToolContext], Awaitable[TelemetryAttributes]],
+            ]
+        ] = None,
     ):
         """Args:
-        core_tool: The underlying toolbox_core.py tool instance.
-        auth_config: Credential configuration to handle interactive flows.
-        adk_token_getters: Tool-specific auth token getters.
+            core_tool: The underlying toolbox_core.py tool instance.
+            auth_config: Credential configuration to handle interactive flows.
+            adk_token_getters: Tool-specific auth token getters.
+            telemetry_attributes: Telemetry attributes (model, user id, agent
+                id) sent to the server with each invocation. Either a static
+                TelemetryAttributes instance, or a callable resolved on every
+                invocation; callables taking one argument receive the live
+                ToolContext, mirroring the auth token getter pattern.
         """
+        # We act as a proxy.
+        # We need to extract metadata from the core tool to satisfy BaseTool's contract.
         name = getattr(core_tool, "__name__", None)
         if not name:
             raise ValueError(f"Core tool {core_tool} must have a valid __name__")
@@ -72,6 +88,7 @@ class ToolboxTool(BaseTool):
         self._core_tool = core_tool
         self._auth_config = auth_config
         self._adk_token_getters = adk_token_getters or {}
+        self._telemetry_attributes = telemetry_attributes
 
     def _param_type_to_schema_type(self, param_type: str) -> Type:
         type_map = {
@@ -268,7 +285,21 @@ class ToolboxTool(BaseTool):
                     )
 
         try:
-            return await self._core_tool(**args)
+            # Resolve telemetry attributes onto a per-invocation copy of the
+            # core tool. Unlike the auth getters above, this must not be
+            # assigned back to self._core_tool: attributes resolved from one
+            # ToolContext (e.g. a user id) would otherwise persist and leak
+            # into later invocations served by this same tool instance.
+            core_tool = self._core_tool
+            telemetry_attributes = await self._resolve_telemetry_attributes(
+                tool_context
+            )
+            if telemetry_attributes is not None:
+                core_tool = core_tool.add_telemetry_attributes(telemetry_attributes)
+
+            # Execute the core tool
+            result = await core_tool(**args)
+            return result
         except (TypeError, PermissionError) as e:
             # Propagate system-level errors
             raise e
@@ -283,10 +314,84 @@ class ToolboxTool(BaseTool):
             if reset_token:
                 USER_TOKEN_CONTEXT_VAR.reset(reset_token)
 
+    async def _resolve_telemetry_attributes(
+        self, tool_context: ToolContext
+    ) -> Optional[TelemetryAttributes]:
+        """Resolves the configured telemetry attributes for one invocation.
+
+        Static instances are returned as-is. Callables are invoked on every
+        call; 1-arity callables receive the live tool_context (same arity
+        sniffing as adk_token_getters) and may be sync or async.
+        """
+        attributes = self._telemetry_attributes
+        if attributes is None or isinstance(attributes, TelemetryAttributes):
+            return attributes
+
+        sig = inspect.signature(attributes)
+        if self._accepts_tool_context_arg(sig, tool_context):
+            context_getter = cast(
+                Union[
+                    Callable[[ToolContext], TelemetryAttributes],
+                    Callable[[ToolContext], Awaitable[TelemetryAttributes]],
+                ],
+                attributes,
+            )
+            resolved = context_getter(tool_context)
+        else:
+            no_arg_getter = cast(
+                Union[
+                    Callable[[], TelemetryAttributes],
+                    Callable[[], Awaitable[TelemetryAttributes]],
+                ],
+                attributes,
+            )
+            resolved = no_arg_getter()
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+        return self._validate_resolved_telemetry_attributes(resolved)
+
+    def _validate_resolved_telemetry_attributes(
+        self, resolved: Any
+    ) -> Optional[TelemetryAttributes]:
+        if resolved is None or isinstance(resolved, TelemetryAttributes):
+            return resolved
+        raise TypeError(
+            "telemetry_attributes callable must return TelemetryAttributes or None"
+        )
+
+    def _accepts_tool_context_arg(
+        self, sig: inspect.Signature, tool_context: ToolContext
+    ) -> bool:
+        """Returns whether a callable signature can receive ToolContext."""
+        try:
+            sig.bind(tool_context)
+            return True
+        except TypeError:
+            return False
+
     def bind_params(self, bounded_params: Dict[str, Any]) -> "ToolboxTool":
         new_core_tool = self._core_tool.bind_params(bounded_params)
         return ToolboxTool(
             core_tool=new_core_tool,
             auth_config=self._auth_config,
             adk_token_getters=self._adk_token_getters,
+            telemetry_attributes=self._telemetry_attributes,
         )
+
+    def bind_param(self, param_name: str, param_value: Any) -> "ToolboxTool":
+        """Allows runtime binding of a parameter, delegating to core tool."""
+        return self.bind_params({param_name: param_value})
+
+    def bind_secure_params(self, bound_secure_params: Dict[str, Any]) -> "ToolboxTool":
+        """Allows runtime binding of secure parameters, delegating to core tool."""
+        new_core_tool = self._core_tool.bind_secure_params(bound_secure_params)
+        return ToolboxTool(
+            core_tool=new_core_tool,
+            auth_config=self._auth_config,
+            adk_token_getters=self._adk_token_getters,
+            telemetry_attributes=self._telemetry_attributes,
+        )
+
+    def bind_secure_param(self, param_name: str, param_value: Any) -> "ToolboxTool":
+        """Allows runtime binding of a secure parameter, delegating to core tool."""
+        return self.bind_secure_params({param_name: param_value})

@@ -37,8 +37,12 @@ This file covers the following use cases:
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
+from toolbox_core.protocol import Protocol
 
+from tests.constants import TOOLBOX_SERVER_URL_STABLE
 from toolbox_llamaindex.client import ToolboxClient
+
+pytestmark = pytest.mark.usefixtures("patch_toolbox_client_url")
 
 
 @pytest.mark.asyncio
@@ -47,7 +51,10 @@ class TestE2EClientAsync:
     @pytest.fixture(scope="function")
     def toolbox(self):
         """Provides a ToolboxClient instance for each test."""
-        toolbox = ToolboxClient("http://localhost:5000")
+        # Note: The STABLE URL passed here is automatically patched by the
+        # 'patch_toolbox_client_url' fixture to run against both
+        # the STABLE (5000) and DRAFT (5001) servers.
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
         return toolbox
 
     @pytest_asyncio.fixture(scope="function")
@@ -75,8 +82,7 @@ class TestE2EClientAsync:
 
     async def test_aload_toolset_all(self, toolbox):
         toolset = await toolbox.aload_toolset()
-        assert len(toolset) == 7
-        tool_names = [
+        expected_tools = [
             "get-n-rows",
             "get-row-by-id",
             "get-row-by-id-auth",
@@ -84,10 +90,20 @@ class TestE2EClientAsync:
             "get-row-by-content-auth",
             "search-rows",
             "process-data",
+            "my-secure-tool",
         ]
-        for tool in toolset:
-            name = tool._ToolboxTool__core_tool.__name__
-            assert name in tool_names
+        assert len(toolset) == len(expected_tools)
+        assert {t._ToolboxTool__core_tool.__name__ for t in toolset} == set(
+            expected_tools
+        )
+
+    async def test_aload_toolset_explicit_protocol(self):
+        toolbox = ToolboxClient(
+            TOOLBOX_SERVER_URL_STABLE, protocol=Protocol.MCP_v20251125
+        )
+        toolset = await toolbox.aload_toolset()
+        assert len(toolset) == 7
+        toolbox.close()
 
     async def test_run_tool_async(self, get_n_rows_tool):
         response = await get_n_rows_tool.acall(num_rows="2")
@@ -95,6 +111,19 @@ class TestE2EClientAsync:
         assert "row1" in response.content
         assert "row2" in response.content
         assert "row3" not in response.content
+
+    async def test_run_tool_url_binding_async(self):
+        """Tests URL Parameter Binding natively handled by the server."""
+        toolbox = ToolboxClient(f"{TOOLBOX_SERVER_URL_STABLE}?num_rows=2")
+        tool = await toolbox.aload_tool("get-n-rows")
+
+        # 'num_rows' is filtered from the schema and automatically injected by the server
+        response = await tool.acall()
+
+        assert "row1" in response.content
+        assert "row2" in response.content
+        assert "row3" not in response.content
+        toolbox.close()
 
     async def test_run_tool_sync(self, get_n_rows_tool):
         response = get_n_rows_tool.call(num_rows="2")
@@ -141,11 +170,14 @@ class TestE2EClientAsync:
             "get-row-by-id-auth",
         )
         auth_tool = tool.add_auth_token_getter("my-test-auth", lambda: auth_token2)
-        with pytest.raises(
-            Exception,
-            match=r"401 \(Unauthorized\)",
-        ):
+        try:
             await auth_tool.acall(id="2")
+            pytest.fail("Expected tool to fail with auth error")
+        except Exception as e:
+            err_str = str(e)
+            assert (
+                "401" in err_str or "-32600" in err_str
+            ), f"Unexpected error message: {err_str}"
 
     async def test_run_tool_auth(self, toolbox, auth_token1):
         """Tests running a tool with correct auth."""
@@ -182,11 +214,11 @@ class TestE2EClientAsync:
             "get-row-by-content-auth",
             auth_token_getters={"my-test-auth": lambda: auth_token1},
         )
-        with pytest.raises(
-            Exception,
-            match='provided parameters were invalid: error parsing authenticated parameter "data": no field named row_data in claims',
-        ):
-            await tool.acall()
+        response = await tool.acall()
+        assert (
+            'provided parameters were invalid: error parsing authenticated parameter "data": no field named row_data in claims'
+            in response.content
+        )
 
 
 @pytest.mark.usefixtures("toolbox_server")
@@ -194,7 +226,10 @@ class TestE2EClientSync:
     @pytest.fixture(scope="session")
     def toolbox(self):
         """Provides a ToolboxClient instance for each test."""
-        toolbox = ToolboxClient("http://localhost:5000")
+        # Note: The STABLE URL passed here is automatically patched by the
+        # 'patch_toolbox_client_url' fixture to run against both
+        # the STABLE (5000) and DRAFT (5001) servers.
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
         return toolbox
 
     @pytest.fixture(scope="function")
@@ -220,10 +255,9 @@ class TestE2EClientSync:
             name = tool._ToolboxTool__core_tool.__name__
             assert name in expected_tools
 
-    def test_aload_toolset_all(self, toolbox):
+    def test_load_toolset_all(self, toolbox):
         toolset = toolbox.load_toolset()
-        assert len(toolset) == 7
-        tool_names = [
+        expected_tools = [
             "get-n-rows",
             "get-row-by-id",
             "get-row-by-id-auth",
@@ -231,10 +265,20 @@ class TestE2EClientSync:
             "get-row-by-content-auth",
             "search-rows",
             "process-data",
+            "my-secure-tool",
         ]
-        for tool in toolset:
-            name = tool._ToolboxTool__core_tool.__name__
-            assert name in tool_names
+        assert len(toolset) == len(expected_tools)
+        assert {t._ToolboxTool__core_tool.__name__ for t in toolset} == set(
+            expected_tools
+        )
+
+    def test_load_toolset_explicit_protocol(self):
+        toolbox = ToolboxClient(
+            TOOLBOX_SERVER_URL_STABLE, protocol=Protocol.MCP_v20251125
+        )
+        toolset = toolbox.load_toolset()
+        assert len(toolset) == 7
+        toolbox.close()
 
     @pytest.mark.asyncio
     async def test_run_tool_async(self, get_n_rows_tool):
@@ -250,6 +294,19 @@ class TestE2EClientSync:
         assert "row1" in response.content
         assert "row2" in response.content
         assert "row3" not in response.content
+
+    def test_run_tool_url_binding_sync(self):
+        """Tests URL Parameter Binding natively handled by the server."""
+        toolbox = ToolboxClient(f"{TOOLBOX_SERVER_URL_STABLE}?num_rows=2")
+        tool = toolbox.load_tool("get-n-rows")
+
+        # 'num_rows' is filtered from the schema and automatically injected by the server
+        response = tool.call()
+
+        assert "row1" in response.content
+        assert "row2" in response.content
+        assert "row3" not in response.content
+        toolbox.close()
 
     def test_run_tool_missing_params(self, get_n_rows_tool):
         with pytest.raises(TypeError, match="missing a required argument: 'num_rows'"):
@@ -288,11 +345,14 @@ class TestE2EClientSync:
             "get-row-by-id-auth",
         )
         auth_tool = tool.add_auth_token_getter("my-test-auth", lambda: auth_token2)
-        with pytest.raises(
-            Exception,
-            match=r"401 \(Unauthorized\)",
-        ):
+        try:
             auth_tool.call(id="2")
+            pytest.fail("Expected tool to fail with auth error")
+        except Exception as e:
+            err_str = str(e)
+            assert (
+                "401" in err_str or "-32600" in err_str
+            ), f"Unexpected error message: {err_str}"
 
     def test_run_tool_auth(self, toolbox, auth_token1):
         """Tests running a tool with correct auth."""
@@ -329,8 +389,97 @@ class TestE2EClientSync:
             "get-row-by-content-auth",
             auth_token_getters={"my-test-auth": lambda: auth_token1},
         )
-        with pytest.raises(
-            Exception,
-            match='provided parameters were invalid: error parsing authenticated parameter "data": no field named row_data in claims',
-        ):
-            tool.call()
+        response = tool.call()
+        assert (
+            'provided parameters were invalid: error parsing authenticated parameter "data": no field named row_data in claims'
+            in response.content
+        )
+
+
+@pytest.mark.usefixtures("toolbox_server")
+class TestSecureParamsE2E:
+    @pytest.mark.asyncio
+    async def test_async_run_tool_with_secure_param(self):
+        """Tests LlamaIndex AsyncToolboxTool with secure parameters."""
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
+        try:
+            tool = await toolbox.aload_tool("my-secure-tool")
+            bound_tool = tool.bind_secure_param("name", "Alice")
+            response = await bound_tool.acall(id=1)
+            assert isinstance(response.content, str)
+            assert "Alice" in response.content
+        finally:
+            toolbox.close()
+
+    def test_sync_run_tool_with_secure_param(self):
+        """Tests LlamaIndex ToolboxTool with secure parameters."""
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
+        try:
+            tool = toolbox.load_tool("my-secure-tool")
+            bound_tool = tool.bind_secure_param("name", "Alice")
+            response = bound_tool.call(id=1)
+            assert isinstance(response.content, str)
+            assert "Alice" in response.content
+        finally:
+            toolbox.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "param_name", "param_val", "expected_match"),
+        [
+            (
+                "bind_param",
+                "name",
+                "Alice",
+                "parameter 'name' is a secure parameter; use bind_secure_param/bind_secure_params instead",
+            ),
+            (
+                "bind_secure_param",
+                "id",
+                1,
+                "parameter 'id' is a regular parameter; use bind_param/bind_params instead",
+            ),
+        ],
+    )
+    async def test_async_cross_binding_guidance_error(
+        self, method_name, param_name, param_val, expected_match
+    ):
+        """Tests that cross-binding on LlamaIndex async tool raises guidance error."""
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
+        try:
+            tool = await toolbox.aload_tool("my-secure-tool")
+            method = getattr(tool, method_name)
+            with pytest.raises(ValueError, match=expected_match):
+                method(param_name, param_val)
+        finally:
+            toolbox.close()
+
+    @pytest.mark.parametrize(
+        ("method_name", "param_name", "param_val", "expected_match"),
+        [
+            (
+                "bind_param",
+                "name",
+                "Alice",
+                "parameter 'name' is a secure parameter; use bind_secure_param/bind_secure_params instead",
+            ),
+            (
+                "bind_secure_param",
+                "id",
+                1,
+                "parameter 'id' is a regular parameter; use bind_param/bind_params instead",
+            ),
+        ],
+    )
+    def test_sync_cross_binding_guidance_error(
+        self, method_name, param_name, param_val, expected_match
+    ):
+        """Tests that cross-binding on LlamaIndex sync tool raises guidance error."""
+        toolbox = ToolboxClient(TOOLBOX_SERVER_URL_STABLE)
+        try:
+            tool = toolbox.load_tool("my-secure-tool")
+            method = getattr(tool, method_name)
+            with pytest.raises(ValueError, match=expected_match):
+                method(param_name, param_val)
+        finally:
+            toolbox.close()

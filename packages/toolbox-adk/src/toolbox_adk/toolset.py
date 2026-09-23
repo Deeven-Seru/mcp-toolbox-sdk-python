@@ -18,6 +18,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.tool_context import ToolContext
+from toolbox_core.protocol import TelemetryAttributes
 from toolbox_core.utils import validate_unused_requirements
 from typing_extensions import override
 
@@ -41,6 +42,7 @@ class ToolboxToolset(BaseToolset):
             Dict[str, Union[str, Callable[[], str], Callable[[], Awaitable[str]]]]
         ] = None,
         bound_params: Optional[Mapping[str, Union[Callable[[], Any], Any]]] = None,
+        secure_params: Optional[Mapping[str, Union[Callable[[], Any], Any]]] = None,
         auth_token_getters: Optional[
             Mapping[
                 str,
@@ -50,6 +52,15 @@ class ToolboxToolset(BaseToolset):
                     Callable[[ToolContext], str],
                     Callable[[ToolContext], Awaitable[str]],
                 ],
+            ]
+        ] = None,
+        telemetry_attributes: Optional[
+            Union[
+                TelemetryAttributes,
+                Callable[[], TelemetryAttributes],
+                Callable[[ToolContext], TelemetryAttributes],
+                Callable[[], Awaitable[TelemetryAttributes]],
+                Callable[[ToolContext], Awaitable[TelemetryAttributes]],
             ]
         ] = None,
         **kwargs: Any,
@@ -62,7 +73,13 @@ class ToolboxToolset(BaseToolset):
             credentials: Authentication configuration.
             additional_headers: Extra headers (static or dynamic).
             bound_params: Parameters to bind globally to loaded tools.
+            secure_params: Secure parameters to bind globally to loaded tools.
             auth_token_getters: Mapping of auth service names to token getters.
+            telemetry_attributes: Telemetry attributes (model, user id, agent
+                id) sent to the server with each tool invocation. Either a
+                static TelemetryAttributes instance, or a callable resolved on
+                every invocation; callables taking one argument receive the
+                live ToolContext.
         """
         super().__init__()
         self.__server_url = server_url
@@ -74,7 +91,9 @@ class ToolboxToolset(BaseToolset):
         self.__toolset_name = toolset_name
         self.__tool_names = tool_names
         self.__bound_params = bound_params
+        self.__secure_params = secure_params
         self.__auth_token_getters = auth_token_getters
+        self.__telemetry_attributes = telemetry_attributes
 
     @property
     def client(self) -> ToolboxClient:
@@ -96,10 +115,14 @@ class ToolboxToolset(BaseToolset):
 
         tools = []
         # 1. Load specific toolset if requested
+        load_kwargs: dict[str, Any] = {"bound_params": self.__bound_params or {}}
+        if self.__secure_params is not None:
+            load_kwargs["secure_params"] = self.__secure_params
+
         if self.__toolset_name:
             core_tools = await self.client.load_toolset(
                 self.__toolset_name,
-                bound_params=self.__bound_params or {},
+                **load_kwargs,
             )
             tools.extend(core_tools)
 
@@ -108,7 +131,7 @@ class ToolboxToolset(BaseToolset):
             for name in self.__tool_names:
                 core_tool = await self.client.load_tool(
                     name,
-                    bound_params=self.__bound_params or {},
+                    **load_kwargs,
                 )
                 tools.append(core_tool)
 
@@ -116,7 +139,7 @@ class ToolboxToolset(BaseToolset):
         if not self.__toolset_name and not self.__tool_names:
             core_tools = await self.client.load_toolset(
                 None,
-                bound_params=self.__bound_params or {},
+                **load_kwargs,
             )
             tools.extend(core_tools)
 
@@ -151,6 +174,7 @@ class ToolboxToolset(BaseToolset):
                 core_tool=t,
                 auth_config=self.client.credential_config,
                 adk_token_getters=self.__auth_token_getters,
+                telemetry_attributes=self.__telemetry_attributes,
             )
             for t in tools
         ]

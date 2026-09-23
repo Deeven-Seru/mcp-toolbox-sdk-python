@@ -21,6 +21,8 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Union
 from aiohttp import ClientSession
 from deprecated import deprecated
 
+from toolbox_core.exceptions import ProtocolNegotiationError
+
 from . import version
 from .itransport import ITransport
 from .mcp_transport import (
@@ -28,6 +30,7 @@ from .mcp_transport import (
     McpHttpTransportV20250326,
     McpHttpTransportV20250618,
     McpHttpTransportV20251125,
+    McpHttpTransportV20260728,
 )
 from .protocol import Protocol, ToolSchema
 from .tool import ToolboxTool
@@ -37,6 +40,155 @@ from .utils import (
     validate_unused_requirements,
     warn_if_http_and_headers,
 )
+
+
+class _McpTransportProxy(ITransport):
+    """A proxy transport that transparently handles protocol fallback negotiation."""
+
+    def __init__(
+        self,
+        url: str,
+        session: Optional[ClientSession],
+        protocol: Protocol,
+        client_name: Optional[str],
+        client_version: Optional[str],
+        telemetry_enabled: bool,
+        supported_protocols: Optional[list[str]] = None,
+    ):
+        self._url = url
+        self._session = session
+        self._client_name = client_name
+        self._client_version = client_version
+        self._telemetry_enabled = telemetry_enabled
+        self._supported_protocols = supported_protocols
+        self._active_transport = self._create_transport(protocol)
+
+    def _create_transport(self, protocol: Protocol) -> ITransport:
+        self._current_protocol = protocol
+        match protocol:
+            case Protocol.MCP_v20260728:
+                return McpHttpTransportV20260728(
+                    self._url,
+                    self._session,
+                    protocol,
+                    self._client_name,
+                    self._client_version,
+                    telemetry_enabled=self._telemetry_enabled,
+                    supported_protocols=self._supported_protocols,
+                )
+            case Protocol.MCP_v20251125:
+                return McpHttpTransportV20251125(
+                    self._url,
+                    self._session,
+                    protocol,
+                    self._client_name,
+                    self._client_version,
+                    telemetry_enabled=self._telemetry_enabled,
+                    supported_protocols=self._supported_protocols,
+                )
+            case Protocol.MCP_v20250618:
+                return McpHttpTransportV20250618(
+                    self._url,
+                    self._session,
+                    protocol,
+                    self._client_name,
+                    self._client_version,
+                    telemetry_enabled=self._telemetry_enabled,
+                    supported_protocols=self._supported_protocols,
+                )
+            case Protocol.MCP_v20250326:
+                return McpHttpTransportV20250326(
+                    self._url,
+                    self._session,
+                    protocol,
+                    self._client_name,
+                    self._client_version,
+                    telemetry_enabled=self._telemetry_enabled,
+                    supported_protocols=self._supported_protocols,
+                )
+            case Protocol.MCP_v20241105:
+                return McpHttpTransportV20241105(
+                    self._url,
+                    self._session,
+                    protocol,
+                    self._client_name,
+                    self._client_version,
+                    telemetry_enabled=self._telemetry_enabled,
+                    supported_protocols=self._supported_protocols,
+                )
+            case _:
+                raise ValueError(f"Unsupported MCP protocol version: {protocol}")
+
+    @property
+    def base_url(self) -> str:
+        return self._active_transport.base_url
+
+    @property
+    def _protocol_version(self) -> str:
+        # We must expose this for tests asserting the current protocol version.
+        if hasattr(self, "_current_protocol") and self._current_protocol:
+            return self._current_protocol.value
+        return str(getattr(self._active_transport, "_protocol_version", ""))
+
+    async def _execute_with_fallback(
+        self, method_name: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        while True:
+            try:
+                return await getattr(self._active_transport, method_name)(
+                    *args, **kwargs
+                )
+            except ProtocolNegotiationError as e:
+                server_version = e.negotiated_version
+                all_versions = Protocol.get_supported_mcp_versions()
+
+                try:
+                    server_idx = all_versions.index(server_version)
+                except ValueError:
+                    raise RuntimeError(
+                        f"Server returned unknown protocol version: {server_version}"
+                    )
+
+                # Artificial Array: Server supports this version and all older ones
+                server_supported = all_versions[server_idx:]
+
+                if self._supported_protocols:
+                    client_supported = self._supported_protocols
+                    mutually_supported = [
+                        v for v in client_supported if v in server_supported
+                    ]
+                    if mutually_supported:
+                        fallback_protocol = Protocol(mutually_supported[0])
+                    else:
+                        raise RuntimeError(
+                            "No mutually supported protocol version. "
+                            f"Client supports: {client_supported}, "
+                            f"Server supports (and older): {server_version}"
+                        )
+                else:
+                    fallback_protocol = Protocol(server_version)
+
+                if fallback_protocol.value == self._protocol_version:
+                    raise e
+
+                logging.warning(
+                    f"Protocol fallback required. Switching from "
+                    f"{self._protocol_version} to {fallback_protocol.value}"
+                )
+                await self._active_transport.close()
+                self._active_transport = self._create_transport(fallback_protocol)
+
+    async def tool_get(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._execute_with_fallback("tool_get", *args, **kwargs)
+
+    async def tools_list(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._execute_with_fallback("tools_list", *args, **kwargs)
+
+    async def tool_invoke(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._execute_with_fallback("tool_invoke", *args, **kwargs)
+
+    async def close(self) -> None:
+        await self._active_transport.close()
 
 
 class ToolboxClient:
@@ -57,7 +209,7 @@ class ToolboxClient:
         client_headers: Optional[
             Mapping[str, Union[Callable[[], str], Callable[[], Awaitable[str]], str]]
         ] = None,
-        protocol: Protocol = Protocol.MCP,
+        protocol: Union[Protocol, list[Protocol], list[str]] = Protocol.MCP,
         client_name: Optional[str] = None,
         client_version: Optional[str] = None,
         telemetry_enabled: bool = False,
@@ -73,57 +225,56 @@ class ToolboxClient:
                 should typically be managed externally.
             client_headers: Headers to include in each request sent through this
             client.
-            protocol: The communication protocol to use.
+            protocol: The communication protocol to use. Can be a single version or a list of versions.
+                If no version is given, the latest version is tried for.
+                If a single version is given, then that version is tried for, followed by newest mutually supported version.
+                If a list of versions is provided (e.g. [Protocol.MCP_LATEST, "2025-11-25"]), negotiation is restricted to those versions, and the newest mutually supported version in that range is tried for.
             client_name: Optional client name for identification.
             client_version: Optional client version for identification.
             telemetry_enabled: Whether to enable OpenTelemetry tracing and metrics. (Default: False)
         """
 
-        if protocol != Protocol.MCP_LATEST:
-            logging.warning(
-                f"A newer version of MCP ({Protocol.MCP_LATEST.value}) is available. "
-                "Please use Protocol.MCP_LATEST to use the latest features."
-            )
+        if isinstance(protocol, list):
+            if not protocol:
+                raise ValueError("protocol list cannot be empty")
+            user_protocols = [
+                p.value if isinstance(p, Protocol) else str(p) for p in protocol
+            ]
 
-        match protocol:
-            case Protocol.MCP_v20251125:
-                self.__transport = McpHttpTransportV20251125(
-                    url,
-                    session,
-                    protocol,
-                    client_name,
-                    client_version,
-                    telemetry_enabled=telemetry_enabled,
+            supported_mcp_versions = Protocol.get_supported_mcp_versions()
+            unrecognized = [
+                p for p in user_protocols if p not in supported_mcp_versions
+            ]
+            if unrecognized:
+                logging.warning(
+                    f"Ignoring unrecognized protocol version(s) in request list: {unrecognized}. "
+                    f"Supported versions: {supported_mcp_versions}"
                 )
-            case Protocol.MCP_v20250618:
-                self.__transport = McpHttpTransportV20250618(
-                    url,
-                    session,
-                    protocol,
-                    client_name,
-                    client_version,
-                    telemetry_enabled=telemetry_enabled,
+
+            user_protocols_set = set(user_protocols)
+            # Intersect with the globally sorted list to strictly enforce newest-to-oldest ordering
+            supported_protocols = [
+                v for v in supported_mcp_versions if v in user_protocols_set
+            ]
+            if not supported_protocols:
+                raise ValueError(
+                    f"No supported protocol version found in '{user_protocols}'. "
+                    f"Must include at least one of: {supported_mcp_versions}"
                 )
-            case Protocol.MCP_v20250326:
-                self.__transport = McpHttpTransportV20250326(
-                    url,
-                    session,
-                    protocol,
-                    client_name,
-                    client_version,
-                    telemetry_enabled=telemetry_enabled,
-                )
-            case Protocol.MCP_v20241105:
-                self.__transport = McpHttpTransportV20241105(
-                    url,
-                    session,
-                    protocol,
-                    client_name,
-                    client_version,
-                    telemetry_enabled=telemetry_enabled,
-                )
-            case _:
-                raise ValueError(f"Unsupported MCP protocol version: {protocol}")
+            initial_protocol = Protocol(supported_protocols[0])
+        else:
+            supported_protocols = None
+            initial_protocol = protocol
+
+        self.__transport = _McpTransportProxy(
+            url,
+            session,
+            initial_protocol,
+            client_name,
+            client_version,
+            telemetry_enabled,
+            supported_protocols,
+        )
 
         self.__client_headers = client_headers if client_headers is not None else {}
         warn_if_http_and_headers(url, self.__client_headers)
@@ -141,7 +292,10 @@ class ToolboxClient:
         client_headers: Mapping[
             str, Union[Callable[[], str], Callable[[], Awaitable[str]], str]
         ],
-    ) -> tuple[ToolboxTool, set[str], set[str]]:
+        secure_params: Mapping[
+            str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
+        ] = {},
+    ) -> tuple[ToolboxTool, set[str], set[str], set[str]]:
         """Internal helper to create a callable tool from its schema."""
         # sort into reg, authn, and bound params
         params = []
@@ -156,6 +310,17 @@ class ToolboxClient:
                 bound_params[p.name] = all_bound_params[p.name]
             else:  # regular parameter
                 params.append(p)
+
+        remaining_secure_params = []
+        bound_sec_params: dict[
+            str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
+        ] = {}
+        for sp in schema.secure_parameters:
+            if sp.name in secure_params:
+                bound_sec_params[sp.name] = secure_params[sp.name]
+            else:
+                remaining_secure_params.append(sp)
+        used_secure_keys = set(bound_sec_params.keys())
 
         authn_params, authz_tokens, used_auth_keys = identify_auth_requirements(
             authn_params,
@@ -174,11 +339,13 @@ class ToolboxClient:
             auth_service_token_getters=MappingProxyType(auth_token_getters),
             bound_params=MappingProxyType(bound_params),
             client_headers=MappingProxyType(client_headers),
+            secure_params=tuple(remaining_secure_params),
+            bound_secure_params=MappingProxyType(bound_sec_params),
         )
 
         used_bound_keys = set(bound_params.keys())
 
-        return tool, used_auth_keys, used_bound_keys
+        return tool, used_auth_keys, used_bound_keys, used_secure_keys
 
     async def __aenter__(self):
         """
@@ -220,6 +387,9 @@ class ToolboxClient:
         bound_params: Mapping[
             str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
         ] = {},
+        secure_params: Mapping[
+            str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
+        ] = {},
     ) -> ToolboxTool:
         """
         Asynchronously loads a tool from the server.
@@ -234,6 +404,8 @@ class ToolboxClient:
                 callables that return the corresponding authentication token.
             bound_params: A mapping of parameter names to bind to specific values or
                 callables that are called to produce values as needed.
+            secure_params: A mapping of secure parameter names to bind to specific
+                values or callables.
 
         Returns:
             ToolboxTool: A callable object representing the loaded tool, ready
@@ -242,7 +414,7 @@ class ToolboxClient:
 
         Raises:
             ValueError: If the loaded tool instance fails to utilize at least
-                one provided parameter or auth token (if any provided).
+                one provided parameter, auth token, or secure parameter (if any provided).
         """
         # Resolve client headers
         resolved_headers = {
@@ -258,16 +430,18 @@ class ToolboxClient:
         if name not in manifest.tools:
             # TODO: Better exception
             raise ValueError(f"Tool '{name}' not found!")
-        tool, used_auth_keys, used_bound_keys = self.__parse_tool(
+        tool, used_auth_keys, used_bound_keys, used_secure_keys = self.__parse_tool(
             name,
             manifest.tools[name],
             auth_token_getters,
             bound_params,
             self.__client_headers,
+            secure_params,
         )
 
         provided_auth_keys = set(auth_token_getters.keys())
         provided_bound_keys = set(bound_params.keys())
+        provided_secure_keys = set(secure_params.keys())
 
         validate_unused_requirements(
             provided_auth_keys,
@@ -276,6 +450,8 @@ class ToolboxClient:
             used_bound_keys,
             name,
             is_toolset=False,
+            provided_secure_keys=provided_secure_keys,
+            used_secure_keys=used_secure_keys,
         )
 
         return tool
@@ -290,6 +466,9 @@ class ToolboxClient:
             str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
         ] = {},
         strict: bool = False,
+        secure_params: Mapping[
+            str, Union[Callable[[], Any], Callable[[], Awaitable[Any]], Any]
+        ] = {},
     ) -> list[ToolboxTool]:
         """
         Asynchronously fetches a toolset and loads all tools defined within it.
@@ -301,10 +480,12 @@ class ToolboxClient:
             bound_params: A mapping of parameter names to bind to specific values or
                 callables that are called to produce values as needed.
             strict: If True, raises an error if *any* loaded tool instance fails
-                to utilize all of the given parameters or auth tokens. (if any
+                to utilize all of the given parameters, auth tokens, or secure parameters (if any
                 provided). If False (default), raises an error only if a
-                user-provided parameter or auth token cannot be applied to *any*
+                user-provided parameter, auth token, or secure parameter cannot be applied to *any*
                 loaded tool across the set.
+            secure_params: A mapping of secure parameter names to bind to specific values or
+                callables that are called to produce values as needed.
 
         Returns:
             list[ToolboxTool]: A list of callables, one for each tool defined
@@ -328,17 +509,20 @@ class ToolboxClient:
         tools: list[ToolboxTool] = []
         overall_used_auth_keys: set[str] = set()
         overall_used_bound_params: set[str] = set()
+        overall_used_secure_params: set[str] = set()
         provided_auth_keys = set(auth_token_getters.keys())
         provided_bound_keys = set(bound_params.keys())
+        provided_secure_keys = set(secure_params.keys())
 
         # parse each tool's name and schema into a list of ToolboxTools
         for tool_name, schema in manifest.tools.items():
-            tool, used_auth_keys, used_bound_keys = self.__parse_tool(
+            tool, used_auth_keys, used_bound_keys, used_secure_keys = self.__parse_tool(
                 tool_name,
                 schema,
                 auth_token_getters,
                 bound_params,
                 self.__client_headers,
+                secure_params,
             )
             tools.append(tool)
 
@@ -350,10 +534,13 @@ class ToolboxClient:
                     used_bound_keys,
                     tool_name,
                     is_toolset=False,
+                    provided_secure_keys=provided_secure_keys,
+                    used_secure_keys=used_secure_keys,
                 )
             else:
                 overall_used_auth_keys.update(used_auth_keys)
                 overall_used_bound_params.update(used_bound_keys)
+                overall_used_secure_params.update(used_secure_keys)
 
         validate_unused_requirements(
             provided_auth_keys,
@@ -362,6 +549,8 @@ class ToolboxClient:
             overall_used_bound_params,
             name or "default",
             is_toolset=True,
+            provided_secure_keys=provided_secure_keys,
+            used_secure_keys=overall_used_secure_params,
         )
 
         return tools
